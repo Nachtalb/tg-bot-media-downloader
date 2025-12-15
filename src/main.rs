@@ -1,4 +1,5 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::Shell;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -62,6 +63,10 @@ struct Config {
     /// Offset to add to Message ID for links (useful for local server discrepancy)
     #[clap(long, default_value = "108405")]
     message_id_offset: i32,
+
+    /// Generate shell completions
+    #[clap(long, value_enum)]
+    generate_completions: Option<Shell>,
 }
 
 // --- Event Definitions ---
@@ -148,10 +153,18 @@ const MAX_FILE_SIZE_LOCAL_CONFIRM: u32 = 2000 * 1024 * 1024; // 2000 MB absolute
 
 #[tokio::main]
 async fn main() {
+    let config = Config::parse();
+
+    // Handle completions
+    if let Some(shell) = config.generate_completions {
+        let mut cmd = Config::command();
+        let name = cmd.get_name().to_string();
+        clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+        return;
+    }
+
     pretty_env_logger::init();
     log::info!("Starting Cargo Downloader Bot (Event Based)...");
-
-    let config = Config::parse();
 
     // Create a custom client with increased timeout
     let client = reqwest::Client::builder()
