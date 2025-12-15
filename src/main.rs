@@ -99,8 +99,6 @@ enum DownloadEvent {
     UserMessageSent(MessageId),
     /// User clicked "Clear Errors"
     ClearErrors,
-    /// User confirmed large file download - trigger actual download
-    ConfirmLargeDownload(String, String, bool), // task_id, file_id, file_name, dest_dir, local_mode
     /// User confirmed large file via button (MessageId based)
     UserConfirmed(MessageId, String, bool), // msg_id, dest_dir, local_mode
     /// User cancelled large file via button (MessageId based)
@@ -628,7 +626,6 @@ async fn run_ui_actor(
                             DownloadEvent::ClearErrors => {
                                 tasks.retain(|t| !matches!(t.state, DownloadState::Error(_)));
                             },
-                            DownloadEvent::ConfirmLargeDownload(_, _, _) => {}, // Deprecated
                             DownloadEvent::UserConfirmed(mid, dest_dir, local_mode) => {
                                 // User confirmed download - find the task and start download
                                 if let Some(t) = tasks.iter_mut().find(|x| x.msg_id == mid && x.state == DownloadState::AwaitingConfirmation)
