@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
+use chrono::Local;
 use teloxide::{
     net::Download,
     prelude::*,
@@ -33,6 +34,10 @@ struct Config {
     /// Max concurrent downloads
     #[clap(long, default_value = "10")]
     max_concurrent_downloads: usize,
+
+    /// Create date-based subfolders (e.g., downloads/2023-10-27/)
+    #[clap(long, default_value_t = true)]
+    date_subfolders: bool,
 
     /// Use local Bot API server mode
     #[clap(long)]
@@ -569,6 +574,7 @@ async fn run_ui_actor(
                 let tx_dl = tx.clone();
                 let dest_dir = config.destination.clone();
                 let local_mode = config.local_mode;
+                let date_subfolders = config.date_subfolders;
                 
                 let task_id = t.id.clone();
                 let file_id = t.file_id.clone().expect("Queued task missing file_id");
@@ -587,6 +593,7 @@ async fn run_ui_actor(
                         local_mode,
                         chat_id,
                         msg_id,
+                        date_subfolders,
                     )
                     .await
                     {
@@ -938,6 +945,7 @@ async fn download_file_logic(
     local_mode: bool,
     chat_id: ChatId,
     msg_id: MessageId,
+    date_subfolders: bool,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let file = bot.get_file(file_id.clone()).await?;
     let file_path = file.path.clone();
@@ -946,8 +954,19 @@ async fn download_file_logic(
         .and_then(|ext| ext.to_str())
         .unwrap_or("");
 
+    // Determine final destination directory
+    let mut final_dir = dest_dir.to_string();
+    if date_subfolders {
+        let date_str = Local::now().format("%Y-%m-%d").to_string();
+        final_dir = format!("{}/{}", dest_dir, date_str);
+        // Ensure subfolder exists
+        if fs::metadata(&final_dir).await.is_err() {
+            fs::create_dir_all(&final_dir).await?;
+        }
+    }
+
     let file_name = format!("{}_{}.{}", name_prefix, file_id.0, extension);
-    let destination = format!("{}/{}", dest_dir, file_name);
+    let destination = format!("{}/{}", final_dir, file_name);
 
     // Check if file already exists
     if fs::metadata(&destination).await.is_ok() {
