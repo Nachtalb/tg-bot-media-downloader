@@ -101,6 +101,10 @@ enum DownloadEvent {
     ClearErrors,
     /// User confirmed large file download - trigger actual download
     ConfirmLargeDownload(String, String, bool), // task_id, file_id, file_name, dest_dir, local_mode
+    /// User confirmed large file via button (MessageId based)
+    UserConfirmed(MessageId, String, bool), // msg_id, dest_dir, local_mode
+    /// User cancelled large file via button (MessageId based)
+    UserCancelled(MessageId),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -138,16 +142,23 @@ async fn main() {
 
     let config = Config::parse();
 
+    // Create a custom client with increased timeout
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(86400)) // 24 hours timeout for large downloads
+        .connect_timeout(Duration::from_secs(60))
+        .build()
+        .expect("Failed to build reqwest client");
+
     // Setup bot with custom API server URL if in local mode
     let bot = if config.local_mode {
         log::info!("Running in LOCAL mode");
         log::info!("Bot API server: {}", config.telegram_api_server);
-        Bot::new(config.token.clone()).set_api_url(
+        Bot::with_client(config.token.clone(), client).set_api_url(
             Url::parse(&config.telegram_api_server).expect("Invalid telegram-api-server URL"),
         )
     } else {
         log::info!("Running in STANDARD mode");
-        Bot::new(config.token.clone())
+        Bot::with_client(config.token.clone(), client)
     };
 
     // Create destination folder from config
@@ -239,27 +250,6 @@ async fn file_handler(
     let chat_id = msg.chat.id;
     let msg_id = msg.id;
     let task_id = format!("{}_{}", msg_id, file_id.0);
-
-    // Check if file already exists
-    let expected_filename =
-        get_expected_filename(&bot, &file_id, &file_name_prefix, &config.destination).await;
-    if let Some(filename) = &expected_filename
-        && fs::metadata(filename).await.is_ok()
-    {
-        // File already exists, skip download
-        log::info!("File already exists, skipping: {}", filename);
-
-        let _ = bot
-            .send_message(
-                chat_id,
-                "ℹ️ <b>File already exists</b> - skipping download.",
-            )
-            .parse_mode(ParseMode::Html)
-            .reply_parameters(ReplyParameters::new(msg_id))
-            .await;
-
-        return Ok(());
-    }
 
     // 2. Get or Create Actor Channel
     let tx = {
@@ -411,17 +401,21 @@ async fn file_handler(
         let keyboard = InlineKeyboardMarkup::new(vec![vec![
             InlineKeyboardButton::callback(
                 format!("✅ Download ({})", format_size(file_size)),
-                format!("confirm_download:{}", task_id),
+                format!("confirm_download:{}", msg_id),
             ),
-            InlineKeyboardButton::callback("❌ Cancel", format!("cancel_download:{}", task_id)),
+            InlineKeyboardButton::callback("❌ Cancel", format!("cancel_download:{}", msg_id)),
         ]]);
 
-        let _ = bot
+        let res = bot
             .send_message(chat_id, confirm_text)
             .parse_mode(ParseMode::Html)
             .reply_parameters(ReplyParameters::new(msg_id))
             .reply_markup(keyboard)
             .await;
+
+        if let Err(e) = res {
+            log::error!("Failed to send confirmation message: {}", e);
+        }
 
         return Ok(());
     }
@@ -451,7 +445,16 @@ async fn file_handler(
             .send(DownloadEvent::TaskStarted(task_id.clone()))
             .await;
 
-        match download_file_logic(&bot_dl, &file_id, &file_name_prefix, &dest_dir, local_mode).await
+        match download_file_logic(
+            &bot_dl,
+            &file_id,
+            &file_name_prefix,
+            &dest_dir,
+            local_mode,
+            chat_id,
+            msg_id,
+        )
+        .await
         {
             Ok(_) => {
                 let _ = tx_dl.send(DownloadEvent::TaskDone(task_id.clone())).await;
@@ -489,49 +492,51 @@ async fn callback_handler(
             bot.answer_callback_query(q.id)
                 .text("Errors cleared")
                 .await?;
-        } else if let Some(task_id) = data.strip_prefix("confirm_download:") {
-            // User confirmed large file download
-            let map = senders.lock().await;
-            if let Some(tx) = map.get(&chat_id) {
-                // We need to extract the file info from task_id or store it differently
-                // For now, we'll send the confirmation and let the actor handle extracting from stored FileTask
-                let _ = tx
-                    .send(DownloadEvent::ConfirmLargeDownload(
-                        task_id.to_string(),
-                        config.destination.clone(),
-                        config.local_mode,
-                    ))
-                    .await;
+        } else if let Some(msg_id_str) = data.strip_prefix("confirm_download:") {
+            if let Ok(msg_id_val) = msg_id_str.parse::<i32>() {
+                let msg_id = MessageId(msg_id_val);
+                // User confirmed large file download
+                let map = senders.lock().await;
+                if let Some(tx) = map.get(&chat_id) {
+                    let _ = tx
+                        .send(DownloadEvent::UserConfirmed(
+                            msg_id,
+                            config.destination.clone(),
+                            config.local_mode,
+                        ))
+                        .await;
+                }
+
+                bot.answer_callback_query(q.id)
+                    .text("Download started...")
+                    .await?;
+
+                // Edit the confirmation message
+                if let Some(MaybeInaccessibleMessage::Regular(msg)) = &q.message {
+                    let _ = bot
+                        .edit_message_text(chat_id, msg.id, "✅ Download confirmed and started.")
+                        .await;
+                }
             }
+        } else if let Some(msg_id_str) = data.strip_prefix("cancel_download:") {
+            if let Ok(msg_id_val) = msg_id_str.parse::<i32>() {
+                let msg_id = MessageId(msg_id_val);
+                // User cancelled large file download
+                let map = senders.lock().await;
+                if let Some(tx) = map.get(&chat_id) {
+                    let _ = tx.send(DownloadEvent::UserCancelled(msg_id)).await;
+                }
 
-            bot.answer_callback_query(q.id)
-                .text("Download started...")
-                .await?;
+                bot.answer_callback_query(q.id)
+                    .text("Download cancelled")
+                    .await?;
 
-            // Edit the confirmation message
-            if let Some(MaybeInaccessibleMessage::Regular(msg)) = &q.message {
-                let _ = bot
-                    .edit_message_text(chat_id, msg.id, "✅ Download confirmed and started.")
-                    .await;
-            }
-        } else if let Some(task_id) = data.strip_prefix("cancel_download:") {
-            // User cancelled large file download
-            let map = senders.lock().await;
-            if let Some(tx) = map.get(&chat_id) {
-                let _ = tx
-                    .send(DownloadEvent::TaskRemove(task_id.to_string()))
-                    .await;
-            }
-
-            bot.answer_callback_query(q.id)
-                .text("Download cancelled")
-                .await?;
-
-            // Edit the confirmation message
-            if let Some(MaybeInaccessibleMessage::Regular(msg)) = &q.message {
-                let _ = bot
-                    .edit_message_text(chat_id, msg.id, "❌ Download cancelled.")
-                    .await;
+                // Edit the confirmation message
+                if let Some(MaybeInaccessibleMessage::Regular(msg)) = &q.message {
+                    let _ = bot
+                        .edit_message_text(chat_id, msg.id, "❌ Download cancelled.")
+                        .await;
+                }
             }
         }
     }
@@ -623,9 +628,10 @@ async fn run_ui_actor(
                             DownloadEvent::ClearErrors => {
                                 tasks.retain(|t| !matches!(t.state, DownloadState::Error(_)));
                             },
-                            DownloadEvent::ConfirmLargeDownload(tid, dest_dir, local_mode) => {
+                            DownloadEvent::ConfirmLargeDownload(_, _, _) => {}, // Deprecated
+                            DownloadEvent::UserConfirmed(mid, dest_dir, local_mode) => {
                                 // User confirmed download - find the task and start download
-                                if let Some(t) = tasks.iter_mut().find(|x| x.id == tid)
+                                if let Some(t) = tasks.iter_mut().find(|x| x.msg_id == mid && x.state == DownloadState::AwaitingConfirmation)
                                     && let Some(file_id) = &t.file_id {
                                         t.state = DownloadState::Queued;
 
@@ -633,15 +639,26 @@ async fn run_ui_actor(
                                         let bot_clone = bot.clone();
                                         let file_id_clone = file_id.clone();
                                         let file_name = t.file_name.clone();
-                                        let task_id_clone = tid.clone();
+                                        let task_id_clone = t.id.clone();
                                         let tx_clone = tx.clone();
+                                        let msg_id = t.msg_id;
 
                                         tokio::spawn(async move {
                                             let _ = tx_clone
                                                 .send(DownloadEvent::TaskStarted(task_id_clone.clone()))
                                                 .await;
 
-                                            match download_file_logic(&bot_clone, &file_id_clone, &file_name, &dest_dir, local_mode).await {
+                                            match download_file_logic(
+                                                &bot_clone,
+                                                &file_id_clone,
+                                                &file_name,
+                                                &dest_dir,
+                                                local_mode,
+                                                chat_id,
+                                                msg_id,
+                                            )
+                                            .await
+                                            {
                                                 Ok(_) => {
                                                     let _ = tx_clone.send(DownloadEvent::TaskDone(task_id_clone.clone())).await;
                                                     time::sleep(Duration::from_secs(3)).await;
@@ -655,6 +672,11 @@ async fn run_ui_actor(
                                             }
                                         });
                                     }
+                            },
+                            DownloadEvent::UserCancelled(mid) => {
+                                if let Some(pos) = tasks.iter().position(|x| x.msg_id == mid && x.state == DownloadState::AwaitingConfirmation) {
+                                    tasks.remove(pos);
+                                }
                             }
                         }
                     }
@@ -892,32 +914,15 @@ fn generate_status_text(
     (text, keyboard)
 }
 
-async fn get_expected_filename(
-    bot: &Bot,
-    file_id: &FileId,
-    name_prefix: &str,
-    dest_dir: &str,
-) -> Option<String> {
-    match bot.get_file(file_id.clone()).await {
-        Ok(file) => {
-            let extension = Path::new(&file.path)
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("");
-            let file_name = format!("{}_{}.{}", name_prefix, file_id.0, extension);
-            Some(format!("{}/{}", dest_dir, file_name))
-        }
-        Err(_) => None,
-    }
-}
-
 async fn download_file_logic(
     bot: &Bot,
     file_id: &FileId,
     name_prefix: &str,
     dest_dir: &str,
     local_mode: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    chat_id: ChatId,
+    msg_id: MessageId,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let file = bot.get_file(file_id.clone()).await?;
     let file_path = file.path.clone();
     let extension = Path::new(&file_path)
@@ -927,6 +932,20 @@ async fn download_file_logic(
 
     let file_name = format!("{}_{}.{}", name_prefix, file_id.0, extension);
     let destination = format!("{}/{}", dest_dir, file_name);
+
+    // Check if file already exists
+    if fs::metadata(&destination).await.is_ok() {
+        log::info!("File already exists, skipping: {}", destination);
+        let _ = bot
+            .send_message(
+                chat_id,
+                "ℹ️ <b>File already exists</b> - skipping download.",
+            )
+            .parse_mode(ParseMode::Html)
+            .reply_parameters(ReplyParameters::new(msg_id))
+            .await;
+        return Ok(false);
+    }
 
     if local_mode {
         // In local mode, file.path is an absolute path on the local filesystem
@@ -941,7 +960,7 @@ async fn download_file_logic(
         match fs::rename(&file_path, &destination).await {
             Ok(_) => {
                 log::info!("File moved successfully");
-                Ok(())
+                Ok(true)
             }
             Err(e) => {
                 log::warn!("Move failed ({}), trying copy instead", e);
@@ -949,13 +968,13 @@ async fn download_file_logic(
                 fs::copy(&file_path, &destination).await?;
                 // Optionally delete the original
                 let _ = fs::remove_file(&file_path).await;
-                Ok(())
+                Ok(true)
             }
         }
     } else {
         // Standard mode: download from Telegram servers
         let mut dest_file = fs::File::create(&destination).await?;
         bot.download_file(&file.path, &mut dest_file).await?;
-        Ok(())
+        Ok(true)
     }
 }
