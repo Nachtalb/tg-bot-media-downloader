@@ -22,6 +22,10 @@ use url::Url;
 #[derive(Parser, Debug, Clone)]
 #[clap(author, version, about = "Telegram file downloader bot")]
 struct Config {
+    /// Token
+    #[clap(short, long)]
+    token: String,
+
     /// Destination folder for downloaded files
     #[clap(short, long, default_value = "downloads")]
     destination: String,
@@ -96,7 +100,7 @@ enum DownloadEvent {
     /// User clicked "Clear Errors"
     ClearErrors,
     /// User confirmed large file download - trigger actual download
-    ConfirmLargeDownload(String, FileId, String, String, bool), // task_id, file_id, file_name, dest_dir, local_mode
+    ConfirmLargeDownload(String, String, bool), // task_id, file_id, file_name, dest_dir, local_mode
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -116,9 +120,8 @@ struct FileTask {
     state: DownloadState,
     link: String,
     size_bytes: u32,
-    file_name: String,       // The actual file name for error messages
-    chat_id: ChatId,         // For building private chat links
-    file_id: Option<FileId>, // Store for deferred download
+    file_name: String,
+    file_id: Option<FileId>,
 }
 
 // Global Map: ChatId -> Sender channel for that chat's actor
@@ -140,10 +143,11 @@ async fn main() {
         log::info!("Running in LOCAL mode");
         log::info!("Bot API server: {}", config.telegram_api_server);
         let api_url = format!("{}/bot", config.telegram_api_server);
-        Bot::from_env().set_api_url(Url::parse(&api_url).expect("Invalid telegram-api-server URL"))
+        Bot::new(config.token.clone())
+            .set_api_url(Url::parse(&api_url).expect("Invalid telegram-api-server URL"))
     } else {
         log::info!("Running in STANDARD mode");
-        Bot::from_env()
+        Bot::new(config.token.clone())
     };
 
     // Create destination folder from config
@@ -281,7 +285,7 @@ async fn file_handler(
     let message_link = build_message_link(&msg);
 
     // Determine max file size based on mode
-    let (max_size, needs_confirmation) = if config.local_mode {
+    let (_max_size, needs_confirmation) = if config.local_mode {
         if file_size > MAX_FILE_SIZE_LOCAL_CONFIRM {
             // Exceeds absolute maximum
             let _ = tx
@@ -296,7 +300,6 @@ async fn file_handler(
                     link: message_link.clone(),
                     size_bytes: file_size,
                     file_name: file_name_prefix.clone(),
-                    chat_id,
                     file_id: None,
                 }))
                 .await;
@@ -345,7 +348,6 @@ async fn file_handler(
                     link: message_link.clone(),
                     size_bytes: file_size,
                     file_name: file_name_prefix.clone(),
-                    chat_id,
                     file_id: None,
                 }))
                 .await;
@@ -386,7 +388,6 @@ async fn file_handler(
                 link: message_link.clone(),
                 size_bytes: file_size,
                 file_name: file_name_prefix.clone(),
-                chat_id,
                 file_id: Some(file_id.clone()),
             }))
             .await;
@@ -435,7 +436,6 @@ async fn file_handler(
             link: message_link,
             size_bytes: file_size,
             file_name: file_name_prefix.clone(),
-            chat_id,
             file_id: Some(file_id.clone()),
         }))
         .await;
@@ -469,34 +469,6 @@ async fn file_handler(
     Ok(())
 }
 
-// Helper function to start download (used by both initial handler and confirmation callback)
-async fn start_download(
-    bot: Bot,
-    file_id: FileId,
-    file_name_prefix: String,
-    task_id: String,
-    tx: mpsc::Sender<DownloadEvent>,
-    dest_dir: String,
-    local_mode: bool,
-) {
-    tokio::spawn(async move {
-        let _ = tx.send(DownloadEvent::TaskStarted(task_id.clone())).await;
-
-        match download_file_logic(&bot, &file_id, &file_name_prefix, &dest_dir, local_mode).await {
-            Ok(_) => {
-                let _ = tx.send(DownloadEvent::TaskDone(task_id.clone())).await;
-                time::sleep(Duration::from_secs(3)).await;
-                let _ = tx.send(DownloadEvent::TaskRemove(task_id.clone())).await;
-            }
-            Err(e) => {
-                let _ = tx
-                    .send(DownloadEvent::TaskError(task_id.clone(), e.to_string()))
-                    .await;
-            }
-        }
-    });
-}
-
 async fn callback_handler(
     q: CallbackQuery,
     senders: SenderMap,
@@ -526,8 +498,6 @@ async fn callback_handler(
                 let _ = tx
                     .send(DownloadEvent::ConfirmLargeDownload(
                         task_id.to_string(),
-                        FileId("dummy".to_string()), // Will be replaced
-                        String::new(),               // Will be replaced
                         config.destination.clone(),
                         config.local_mode,
                     ))
@@ -653,7 +623,7 @@ async fn run_ui_actor(
                             DownloadEvent::ClearErrors => {
                                 tasks.retain(|t| !matches!(t.state, DownloadState::Error(_)));
                             },
-                            DownloadEvent::ConfirmLargeDownload(tid, _, _, dest_dir, local_mode) => {
+                            DownloadEvent::ConfirmLargeDownload(tid, dest_dir, local_mode) => {
                                 // User confirmed download - find the task and start download
                                 if let Some(t) = tasks.iter_mut().find(|x| x.id == tid)
                                     && let Some(file_id) = &t.file_id {
