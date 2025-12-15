@@ -9,7 +9,7 @@ use teloxide::{
     prelude::*,
     types::{
         FileId, InlineKeyboardButton, InlineKeyboardMarkup, MaybeInaccessibleMessage, MessageId,
-        ParseMode, ReplyParameters,
+        ParseMode, ReplyParameters, UserId,
     },
 };
 use tokio::fs;
@@ -49,6 +49,10 @@ struct Config {
     /// Address to listen on
     #[clap(long, default_value = "127.0.0.1")]
     listen: String,
+
+    /// Offset to add to Message ID for links (useful for local server discrepancy)
+    #[clap(long, default_value = "0")]
+    message_id_offset: i32,
 }
 
 // --- Event Definitions ---
@@ -159,6 +163,11 @@ async fn main() {
         Bot::with_client(config.token.clone(), client)
     };
 
+    // Get Bot ID for link generation
+    let bot_user = bot.get_me().await.expect("Failed to get bot info");
+    let bot_id = bot_user.id;
+    log::info!("Bot ID: {}", bot_id);
+
     // Create destination folder from config
     fs::create_dir_all(&config.destination)
         .await
@@ -195,7 +204,7 @@ async fn main() {
         .branch(callback_handler);
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![senders, config])
+        .dependencies(dptree::deps![senders, config, bot_id])
         .distribution_function(|_| None::<()>)
         .enable_ctrlc_handler()
         .build()
@@ -210,6 +219,7 @@ async fn file_handler(
     msg: Message,
     senders: SenderMap,
     config: Config,
+    bot_id: UserId,
 ) -> ResponseResult<()> {
     // 1. Identify content
     let (file_id, file_name_prefix, file_size) = if let Some(photos) = msg.photo() {
@@ -270,7 +280,7 @@ async fn file_handler(
 
     // 4. Validate Size
     let link_text = format!("Media #{}", msg_id);
-    let message_link = build_message_link(&msg);
+    let message_link = build_message_link(&msg, bot_id, config.message_id_offset);
 
     // Determine max file size based on mode
     let (_max_size, needs_confirmation) = if config.local_mode {
@@ -760,18 +770,26 @@ async fn send_new(
 
 // --- Helpers ---
 
-fn build_message_link(msg: &Message) -> String {
+fn build_message_link(msg: &Message, bot_id: UserId, offset: i32) -> String {
     // Try to get the public URL first (for groups/channels)
     if let Some(url) = msg.url() {
         return url.to_string();
     }
 
-    // For private chats, build a tg:// link using chat_id
-    // In private chats, chat.id is the same as the user's id
-    format!(
-        "tg://openmessage?user_id={}&message_id={}",
-        msg.chat.id, msg.id
-    )
+    let link_msg_id = msg.id.0 + offset;
+
+    // For private chats, build a tg:// link using bot_id (so the user opens the chat with the bot)
+    if msg.chat.is_private() {
+        format!(
+            "tg://openmessage?user_id={}&message_id={}",
+            bot_id, link_msg_id
+        )
+    } else {
+        format!(
+            "tg://openmessage?chat_id={}&message_id={}",
+            msg.chat.id, link_msg_id
+        )
+    }
 }
 
 fn format_size(size: u32) -> String {
