@@ -51,7 +51,7 @@ struct Config {
     listen: String,
 
     /// Offset to add to Message ID for links (useful for local server discrepancy)
-    #[clap(long, default_value = "0")]
+    #[clap(long, default_value = "108405")]
     message_id_offset: i32,
 }
 
