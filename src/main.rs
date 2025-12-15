@@ -142,9 +142,9 @@ async fn main() {
     let bot = if config.local_mode {
         log::info!("Running in LOCAL mode");
         log::info!("Bot API server: {}", config.telegram_api_server);
-        let api_url = format!("{}/bot", config.telegram_api_server);
-        Bot::new(config.token.clone())
-            .set_api_url(Url::parse(&api_url).expect("Invalid telegram-api-server URL"))
+        Bot::new(config.token.clone()).set_api_url(
+            Url::parse(&config.telegram_api_server).expect("Invalid telegram-api-server URL"),
+        )
     } else {
         log::info!("Running in STANDARD mode");
         Bot::new(config.token.clone())
