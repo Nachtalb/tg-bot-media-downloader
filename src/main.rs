@@ -9,7 +9,7 @@ use teloxide::{
     prelude::*,
     types::{
         FileId, InlineKeyboardButton, InlineKeyboardMarkup, MaybeInaccessibleMessage, MessageId,
-        ParseMode, ReplyParameters, UserId,
+        MessageOrigin, ParseMode, ReplyParameters, UserId,
     },
 };
 use tokio::fs;
@@ -29,6 +29,10 @@ struct Config {
     /// Destination folder for downloaded files
     #[clap(short, long, default_value = "downloads")]
     destination: String,
+
+    /// Max concurrent downloads
+    #[clap(long, default_value = "10")]
+    max_concurrent_downloads: usize,
 
     /// Use local Bot API server mode
     #[clap(long)]
@@ -104,7 +108,7 @@ enum DownloadEvent {
     /// User clicked "Clear Errors"
     ClearErrors,
     /// User confirmed large file via button (MessageId based)
-    UserConfirmed(MessageId, String, bool), // msg_id, dest_dir, local_mode
+    UserConfirmed(MessageId),
     /// User cancelled large file via button (MessageId based)
     UserCancelled(MessageId),
 }
@@ -222,7 +226,7 @@ async fn file_handler(
     bot_id: UserId,
 ) -> ResponseResult<()> {
     // 1. Identify content
-    let (file_id, file_name_prefix, file_size) = if let Some(photos) = msg.photo() {
+    let (file_id, mut file_name_prefix, file_size) = if let Some(photos) = msg.photo() {
         if let Some(p) = photos.last() {
             (p.file.id.clone(), "photo".to_string(), p.file.size)
         } else {
@@ -255,6 +259,20 @@ async fn file_handler(
         return Ok(());
     };
 
+    // Handle Forwarded Message
+    if let Some(origin) = msg.forward_origin() {
+        let fwd_id = match origin {
+            MessageOrigin::User { sender_user, .. } => Some(sender_user.id.0),
+            MessageOrigin::Chat { sender_chat, .. } => Some(sender_chat.id.0 as u64),
+            MessageOrigin::Channel { chat, .. } => Some(chat.id.0 as u64),
+            MessageOrigin::HiddenUser { .. } => None,
+        };
+
+        if let Some(id) = fwd_id {
+            file_name_prefix = format!("{}_fwd{}", file_name_prefix, id);
+        }
+    }
+
     let chat_id = msg.chat.id;
     let msg_id = msg.id;
     let task_id = format!("{}_{}", msg_id, file_id.0);
@@ -269,8 +287,9 @@ async fn file_handler(
             let (tx, rx) = mpsc::channel(100);
             map.insert(chat_id, tx.clone());
             let bot_clone = bot.clone();
+            let config_clone = config.clone();
             let tx_for_actor = tx.clone(); // Clone for actor to use when spawning downloads
-            tokio::spawn(run_ui_actor(bot_clone, chat_id, rx, tx_for_actor));
+            tokio::spawn(run_ui_actor(bot_clone, chat_id, rx, tx_for_actor, config_clone));
             tx
         }
     };
@@ -442,41 +461,6 @@ async fn file_handler(
         }))
         .await;
 
-    // 6. Spawn Download Task
-    let bot_dl = bot.clone();
-    let tx_dl = tx.clone();
-    let dest_dir = config.destination.clone();
-    let local_mode = config.local_mode;
-
-    tokio::spawn(async move {
-        let _ = tx_dl
-            .send(DownloadEvent::TaskStarted(task_id.clone()))
-            .await;
-
-        match download_file_logic(
-            &bot_dl,
-            &file_id,
-            &file_name_prefix,
-            &dest_dir,
-            local_mode,
-            chat_id,
-            msg_id,
-        )
-        .await
-        {
-            Ok(_) => {
-                let _ = tx_dl.send(DownloadEvent::TaskDone(task_id.clone())).await;
-                time::sleep(Duration::from_secs(3)).await;
-                let _ = tx_dl.send(DownloadEvent::TaskRemove(task_id.clone())).await;
-            }
-            Err(e) => {
-                let _ = tx_dl
-                    .send(DownloadEvent::TaskError(task_id.clone(), e.to_string()))
-                    .await;
-            }
-        }
-    });
-
     Ok(())
 }
 
@@ -484,7 +468,6 @@ async fn callback_handler(
     q: CallbackQuery,
     senders: SenderMap,
     bot: Bot,
-    config: Config,
 ) -> ResponseResult<()> {
     if let Some(data) = &q.data {
         let chat_id = match &q.message {
@@ -506,13 +489,7 @@ async fn callback_handler(
                 // User confirmed large file download
                 let map = senders.lock().await;
                 if let Some(tx) = map.get(&chat_id) {
-                    let _ = tx
-                        .send(DownloadEvent::UserConfirmed(
-                            msg_id,
-                            config.destination.clone(),
-                            config.local_mode,
-                        ))
-                        .await;
+                    let _ = tx.send(DownloadEvent::UserConfirmed(msg_id)).await;
                 }
 
                 bot.answer_callback_query(q.id)
@@ -558,11 +535,13 @@ async fn run_ui_actor(
     chat_id: ChatId,
     mut rx: mpsc::Receiver<DownloadEvent>,
     tx: mpsc::Sender<DownloadEvent>,
+    config: Config,
 ) {
     // Local State (No Mutex needed! Single thread ownership)
     let mut tasks: VecDeque<FileTask> = VecDeque::new();
     let mut status_msg_id: Option<MessageId> = None;
     let mut last_user_msg_id: MessageId = MessageId(0);
+    let mut active_downloads = 0;
 
     // Load statistics from disk
     let mut stats = Statistics::load(chat_id).await;
@@ -574,6 +553,62 @@ async fn run_ui_actor(
     let mut ticker = time::interval(Duration::from_secs(1));
 
     loop {
+        // 0. Queue Processor: Spawn tasks if slots available
+        while active_downloads < config.max_concurrent_downloads {
+            if let Some(t) = tasks
+                .iter_mut()
+                .find(|x| matches!(x.state, DownloadState::Queued))
+            {
+                // Found a queued task - Spawn it
+                t.state = DownloadState::Downloading;
+                active_downloads += 1;
+                dirty = true;
+
+                // Prepare data for spawn
+                let bot_dl = bot.clone();
+                let tx_dl = tx.clone();
+                let dest_dir = config.destination.clone();
+                let local_mode = config.local_mode;
+                
+                let task_id = t.id.clone();
+                let file_id = t.file_id.clone().expect("Queued task missing file_id");
+                let file_name = t.file_name.clone();
+                let msg_id = t.msg_id;
+                let chat_id = chat_id;
+
+                tokio::spawn(async move {
+                    let _ = tx_dl.send(DownloadEvent::TaskStarted(task_id.clone())).await;
+
+                    match download_file_logic(
+                        &bot_dl,
+                        &file_id,
+                        &file_name,
+                        &dest_dir,
+                        local_mode,
+                        chat_id,
+                        msg_id,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            let _ = tx_dl.send(DownloadEvent::TaskDone(task_id.clone())).await;
+                            time::sleep(Duration::from_secs(3)).await;
+                            let _ = tx_dl
+                                .send(DownloadEvent::TaskRemove(task_id.clone()))
+                                .await;
+                        }
+                        Err(e) => {
+                            let _ = tx_dl
+                                .send(DownloadEvent::TaskError(task_id.clone(), e.to_string()))
+                                .await;
+                        }
+                    }
+                });
+            } else {
+                break; // No more queued tasks
+            }
+        }
+
         tokio::select! {
             // 1. Handle incoming events (Instant State Update)
             event = rx.recv() => {
@@ -583,6 +618,7 @@ async fn run_ui_actor(
                         match e {
                             DownloadEvent::TaskAdded(t) => tasks.push_back(t),
                             DownloadEvent::TaskStarted(tid) => {
+                                // Task explicitly reported starting (redundant but good for consistency)
                                 if let Some(t) = tasks.iter_mut().find(|x| x.id == tid) {
                                     t.state = DownloadState::Downloading;
                                 }
@@ -590,6 +626,7 @@ async fn run_ui_actor(
                             DownloadEvent::TaskDone(tid) => {
                                 if let Some(t) = tasks.iter_mut().find(|x| x.id == tid) {
                                     t.state = DownloadState::Done;
+                                    active_downloads = active_downloads.saturating_sub(1);
                                     // Update statistics
                                     stats.total_downloaded_count += 1;
                                     stats.total_downloaded_bytes += t.size_bytes as u64;
@@ -600,6 +637,7 @@ async fn run_ui_actor(
                             DownloadEvent::TaskError(tid, err) => {
                                 if let Some(t) = tasks.iter_mut().find(|x| x.id == tid) {
                                     t.state = DownloadState::Error(err.clone());
+                                    active_downloads = active_downloads.saturating_sub(1);
 
                                     // Send a static error message
                                     let error_text = if !t.link.is_empty() {
@@ -636,49 +674,12 @@ async fn run_ui_actor(
                             DownloadEvent::ClearErrors => {
                                 tasks.retain(|t| !matches!(t.state, DownloadState::Error(_)));
                             },
-                            DownloadEvent::UserConfirmed(mid, dest_dir, local_mode) => {
-                                // User confirmed download - find the task and start download
-                                if let Some(t) = tasks.iter_mut().find(|x| x.msg_id == mid && x.state == DownloadState::AwaitingConfirmation)
-                                    && let Some(file_id) = &t.file_id {
-                                        t.state = DownloadState::Queued;
-
-                                        // Spawn the download task
-                                        let bot_clone = bot.clone();
-                                        let file_id_clone = file_id.clone();
-                                        let file_name = t.file_name.clone();
-                                        let task_id_clone = t.id.clone();
-                                        let tx_clone = tx.clone();
-                                        let msg_id = t.msg_id;
-
-                                        tokio::spawn(async move {
-                                            let _ = tx_clone
-                                                .send(DownloadEvent::TaskStarted(task_id_clone.clone()))
-                                                .await;
-
-                                            match download_file_logic(
-                                                &bot_clone,
-                                                &file_id_clone,
-                                                &file_name,
-                                                &dest_dir,
-                                                local_mode,
-                                                chat_id,
-                                                msg_id,
-                                            )
-                                            .await
-                                            {
-                                                Ok(_) => {
-                                                    let _ = tx_clone.send(DownloadEvent::TaskDone(task_id_clone.clone())).await;
-                                                    time::sleep(Duration::from_secs(3)).await;
-                                                    let _ = tx_clone.send(DownloadEvent::TaskRemove(task_id_clone.clone())).await;
-                                                }
-                                                Err(e) => {
-                                                    let _ = tx_clone
-                                                        .send(DownloadEvent::TaskError(task_id_clone.clone(), e.to_string()))
-                                                        .await;
-                                                }
-                                            }
-                                        });
-                                    }
+                            DownloadEvent::UserConfirmed(mid) => {
+                                // User confirmed download - find the task and set to Queued
+                                // The loop will pick it up
+                                if let Some(t) = tasks.iter_mut().find(|x| x.msg_id == mid && x.state == DownloadState::AwaitingConfirmation) {
+                                    t.state = DownloadState::Queued;
+                                }
                             },
                             DownloadEvent::UserCancelled(mid) => {
                                 if let Some(pos) = tasks.iter().position(|x| x.msg_id == mid && x.state == DownloadState::AwaitingConfirmation) {
