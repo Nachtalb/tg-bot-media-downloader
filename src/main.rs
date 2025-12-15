@@ -998,7 +998,14 @@ async fn download_file_logic(
                 Ok(true)
             }
             Err(e) => {
-                log::warn!("Move failed ({}), trying copy instead", e);
+                // Check for cross-device link error (EXDEV = 18 on Linux)
+                let is_cross_device = e.raw_os_error() == Some(18);
+                if is_cross_device {
+                    log::info!("Cross-device move detected, copying file...");
+                } else {
+                    log::warn!("Move failed ({}), trying copy instead", e);
+                }
+
                 // If move fails (e.g., across filesystems), try copy
                 fs::copy(&file_path, &destination).await?;
                 // Optionally delete the original
