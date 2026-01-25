@@ -121,6 +121,8 @@ enum DownloadEvent {
     UserConfirmed(MessageId),
     /// User cancelled large file via button (MessageId based)
     UserCancelled(MessageId),
+    /// User clicked "Resend Confirmations"
+    ResendConfirmations,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -501,6 +503,14 @@ async fn callback_handler(
             bot.answer_callback_query(q.id)
                 .text("Errors cleared")
                 .await?;
+        } else if data == "resend_confirmations" {
+            let map = senders.lock().await;
+            if let Some(tx) = map.get(&chat_id) {
+                let _ = tx.send(DownloadEvent::ResendConfirmations).await;
+            }
+            bot.answer_callback_query(q.id)
+                .text("Resending confirmations...")
+                .await?;
         } else if let Some(msg_id_str) = data.strip_prefix("confirm_download:") {
             if let Ok(msg_id_val) = msg_id_str.parse::<i32>() {
                 let msg_id = MessageId(msg_id_val);
@@ -704,6 +714,43 @@ async fn run_ui_actor(
                             DownloadEvent::UserCancelled(mid) => {
                                 if let Some(pos) = tasks.iter().position(|x| x.msg_id == mid && x.state == DownloadState::AwaitingConfirmation) {
                                     tasks.remove(pos);
+                                }
+                            },
+                            DownloadEvent::ResendConfirmations => {
+                                // Resend confirmation prompts for all tasks awaiting confirmation
+                                for task in tasks.iter() {
+                                    if task.state == DownloadState::AwaitingConfirmation {
+                                        let confirm_text = if !task.link.is_empty() {
+                                            format!(
+                                                "⚠️ <a href=\"{}\">File</a> is large ({}).\n\
+                                                Download may take time. Continue?",
+                                                task.link,
+                                                format_size(task.size_bytes)
+                                            )
+                                        } else {
+                                            format!(
+                                                "⚠️ {} is large ({}).\n\
+                                                Download may take time. Continue?",
+                                                task.name_display,
+                                                format_size(task.size_bytes)
+                                            )
+                                        };
+
+                                        let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                                            InlineKeyboardButton::callback(
+                                                format!("✅ Download ({})", format_size(task.size_bytes)),
+                                                format!("confirm_download:{}", task.msg_id),
+                                            ),
+                                            InlineKeyboardButton::callback("❌ Cancel", format!("cancel_download:{}", task.msg_id)),
+                                        ]]);
+
+                                        let _ = bot
+                                            .send_message(chat_id, confirm_text)
+                                            .parse_mode(ParseMode::Html)
+                                            .reply_parameters(ReplyParameters::new(task.msg_id))
+                                            .reply_markup(keyboard)
+                                            .await;
+                                    }
                                 }
                             }
                         }
@@ -940,9 +987,26 @@ fn generate_status_text(
         format_size_u64(stats.total_downloaded_bytes)
     ));
 
-    let keyboard = if has_errors {
-        let btn = InlineKeyboardButton::callback("Clear Errors 🗑️", "clear_errors");
-        Some(InlineKeyboardMarkup::new(vec![vec![btn]]))
+    // Check if there are any tasks awaiting confirmation
+    let has_awaiting_confirmation = tasks
+        .iter()
+        .any(|t| matches!(t.state, DownloadState::AwaitingConfirmation));
+
+    let keyboard = if has_errors || has_awaiting_confirmation {
+        let mut buttons = vec![];
+
+        if has_awaiting_confirmation {
+            buttons.push(InlineKeyboardButton::callback(
+                "Resend Confirmations 🔔",
+                "resend_confirmations",
+            ));
+        }
+
+        if has_errors {
+            buttons.push(InlineKeyboardButton::callback("Clear Errors 🗑️", "clear_errors"));
+        }
+
+        Some(InlineKeyboardMarkup::new(vec![buttons]))
     } else {
         None
     };
