@@ -123,6 +123,8 @@ enum DownloadEvent {
     UserCancelled(MessageId),
     /// User clicked "Resend Confirmations"
     ResendConfirmations,
+    /// Force status message refresh (e.g., from /start command)
+    RefreshStatus,
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -280,6 +282,33 @@ async fn file_handler(
     config: Config,
     bot_id: UserId,
 ) -> ResponseResult<()> {
+    // Check for /start command
+    if let Some(text) = msg.text() {
+        if text.starts_with("/start") {
+            let chat_id = msg.chat.id;
+            // Get or create actor channel
+            let tx = {
+                let mut map = senders.lock().await;
+                if let Some(tx) = map.get(&chat_id) {
+                    tx.clone()
+                } else {
+                    // Spawn new Actor
+                    let (tx, rx) = mpsc::channel(100);
+                    map.insert(chat_id, tx.clone());
+                    let bot_clone = bot.clone();
+                    let config_clone = config.clone();
+                    let tx_for_actor = tx.clone();
+                    tokio::spawn(run_ui_actor(bot_clone, chat_id, rx, tx_for_actor, config_clone));
+                    tx
+                }
+            };
+
+            // Request status refresh
+            let _ = tx.send(DownloadEvent::RefreshStatus).await;
+            return Ok(());
+        }
+    }
+
     // 1. Identify content
     let (file_id, mut file_name_prefix, file_size) = if let Some(photos) = msg.photo() {
         if let Some(p) = photos.last() {
@@ -852,6 +881,15 @@ async fn run_ui_actor(
                                     }
                                 }
                                 save_queue(chat_id, &tasks).await;
+                            },
+                            DownloadEvent::RefreshStatus => {
+                                // Force refresh status message by deleting old one
+                                if let Some(old_msg_id) = status_msg_id {
+                                    let _ = bot.delete_message(chat_id, old_msg_id).await;
+                                    status_msg_id = None;
+                                }
+                                // Force immediate UI update
+                                dirty = true;
                             }
                         }
                     }
@@ -901,16 +939,19 @@ async fn update_ui(
             let mut req = bot
                 .edit_message_text(chat_id, sid, &text)
                 .parse_mode(ParseMode::Html);
-            if let Some(kb) = keyboard {
-                req = req.reply_markup(kb);
+            if let Some(ref kb) = keyboard {
+                req = req.reply_markup(kb.clone());
             }
             // Note: If text didn't change, Telegram returns error. We ignore it.
             if (req.await).is_err() {
-                // If edit fails (e.g. user deleted msg), reset ID so we send new next time
+                // If edit fails (e.g. user deleted msg, or keyboard changed),
+                // delete old message and send new
+                let _ = bot.delete_message(chat_id, sid).await;
                 *status_msg_id = None;
+                send_new(bot, chat_id, text, keyboard, status_msg_id).await;
             }
         } else {
-            // Fallthrough to send new
+            // Fallthrough to send new (old message already deleted above)
             send_new(bot, chat_id, text, keyboard, status_msg_id).await;
         }
     } else {
