@@ -125,7 +125,7 @@ enum DownloadEvent {
     ResendConfirmations,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 enum DownloadState {
     Queued,
     Downloading,
@@ -134,7 +134,7 @@ enum DownloadState {
     AwaitingConfirmation, // Waiting for user to confirm large file download
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct FileTask {
     id: String,
     msg_id: MessageId,
@@ -152,6 +152,39 @@ type SenderMap = Arc<Mutex<HashMap<ChatId, mpsc::Sender<DownloadEvent>>>>;
 const MAX_FILE_SIZE: u32 = 20 * 1024 * 1024; // 20 MB for non-local mode
 const MAX_FILE_SIZE_LOCAL: u32 = 150 * 1024 * 1024; // 150 MB for local mode (default limit)
 const MAX_FILE_SIZE_LOCAL_CONFIRM: u32 = 2000 * 1024 * 1024; // 2000 MB absolute max for local mode
+
+// --- Queue Persistence ---
+
+async fn save_queue(chat_id: ChatId, tasks: &VecDeque<FileTask>) {
+    // Only save tasks that are awaiting confirmation
+    let tasks_to_save: Vec<&FileTask> = tasks
+        .iter()
+        .filter(|t| matches!(t.state, DownloadState::AwaitingConfirmation))
+        .collect();
+
+    if tasks_to_save.is_empty() {
+        // No tasks to save, remove the file if it exists
+        let filename = format!("queue_{}.json", chat_id);
+        let _ = fs::remove_file(&filename).await;
+        return;
+    }
+
+    let filename = format!("queue_{}.json", chat_id);
+    if let Ok(json) = serde_json::to_string_pretty(&tasks_to_save) {
+        let _ = fs::write(&filename, json).await;
+    }
+}
+
+async fn load_queue(chat_id: ChatId) -> VecDeque<FileTask> {
+    let filename = format!("queue_{}.json", chat_id);
+    match fs::read_to_string(&filename).await {
+        Ok(content) => {
+            let tasks: Vec<FileTask> = serde_json::from_str(&content).unwrap_or_default();
+            tasks.into_iter().collect()
+        }
+        Err(_) => VecDeque::new(),
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -566,7 +599,7 @@ async fn run_ui_actor(
     config: Config,
 ) {
     // Local State (No Mutex needed! Single thread ownership)
-    let mut tasks: VecDeque<FileTask> = VecDeque::new();
+    let mut tasks: VecDeque<FileTask> = load_queue(chat_id).await;
     let mut status_msg_id: Option<MessageId> = None;
     let mut last_user_msg_id: MessageId = MessageId(0);
     let mut active_downloads = 0;
@@ -646,7 +679,13 @@ async fn run_ui_actor(
                     Some(e) => {
                         dirty = true; // Mark needs update
                         match e {
-                            DownloadEvent::TaskAdded(t) => tasks.push_back(t),
+                            DownloadEvent::TaskAdded(t) => {
+                                let is_awaiting = matches!(t.state, DownloadState::AwaitingConfirmation);
+                                tasks.push_back(t);
+                                if is_awaiting {
+                                    save_queue(chat_id, &tasks).await;
+                                }
+                            },
                             DownloadEvent::TaskStarted(tid) => {
                                 // Task explicitly reported starting (redundant but good for consistency)
                                 if let Some(t) = tasks.iter_mut().find(|x| x.id == tid) {
@@ -693,7 +732,11 @@ async fn run_ui_actor(
                                 // Remove if it's done OR awaiting confirmation (for cancellation)
                                 if let Some(pos) = tasks.iter().position(|x| x.id == tid)
                                     && matches!(tasks[pos].state, DownloadState::Done | DownloadState::AwaitingConfirmation) {
+                                        let was_awaiting = matches!(tasks[pos].state, DownloadState::AwaitingConfirmation);
                                         tasks.remove(pos);
+                                        if was_awaiting {
+                                            save_queue(chat_id, &tasks).await;
+                                        }
                                     }
                             },
                             DownloadEvent::UserMessageSent(mid) => {
@@ -709,11 +752,13 @@ async fn run_ui_actor(
                                 // The loop will pick it up
                                 if let Some(t) = tasks.iter_mut().find(|x| x.msg_id == mid && x.state == DownloadState::AwaitingConfirmation) {
                                     t.state = DownloadState::Queued;
+                                    save_queue(chat_id, &tasks).await;
                                 }
                             },
                             DownloadEvent::UserCancelled(mid) => {
                                 if let Some(pos) = tasks.iter().position(|x| x.msg_id == mid && x.state == DownloadState::AwaitingConfirmation) {
                                     tasks.remove(pos);
+                                    save_queue(chat_id, &tasks).await;
                                 }
                             },
                             DownloadEvent::ResendConfirmations => {

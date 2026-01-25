@@ -38,6 +38,7 @@ Cargo.lock
 downloads/*
 !.gitkeep
 stats*.json
+queue*.json
 
 # Claude Code local settings
 .claude/settings.local.json
