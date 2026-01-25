@@ -144,6 +144,8 @@ struct FileTask {
     size_bytes: u32,
     file_name: String,
     file_id: Option<FileId>,
+    #[serde(default)]
+    confirmation_msg_ids: Vec<MessageId>, // Track confirmation messages to delete when resending
 }
 
 // Global Map: ChatId -> Sender channel for that chat's actor
@@ -371,6 +373,7 @@ async fn file_handler(
                     size_bytes: file_size,
                     file_name: file_name_prefix.clone(),
                     file_id: None,
+                    confirmation_msg_ids: vec![],
                 }))
                 .await;
 
@@ -419,6 +422,7 @@ async fn file_handler(
                     size_bytes: file_size,
                     file_name: file_name_prefix.clone(),
                     file_id: None,
+                    confirmation_msg_ids: vec![],
                 }))
                 .await;
 
@@ -449,19 +453,6 @@ async fn file_handler(
 
     // If needs confirmation, send message with button
     if needs_confirmation {
-        let _ = tx
-            .send(DownloadEvent::TaskAdded(FileTask {
-                id: task_id.clone(),
-                msg_id,
-                name_display: link_text.clone(),
-                state: DownloadState::AwaitingConfirmation,
-                link: message_link.clone(),
-                size_bytes: file_size,
-                file_name: file_name_prefix.clone(),
-                file_id: Some(file_id.clone()),
-            }))
-            .await;
-
         let confirm_text = if !message_link.is_empty() {
             format!(
                 "⚠️ <a href=\"{}\">File</a> is large ({}).\n\
@@ -493,9 +484,27 @@ async fn file_handler(
             .reply_markup(keyboard)
             .await;
 
-        if let Err(e) = res {
-            log::error!("Failed to send confirmation message: {}", e);
-        }
+        let confirmation_msg_id = match res {
+            Ok(sent_msg) => vec![sent_msg.id],
+            Err(e) => {
+                log::error!("Failed to send confirmation message: {}", e);
+                vec![]
+            }
+        };
+
+        let _ = tx
+            .send(DownloadEvent::TaskAdded(FileTask {
+                id: task_id.clone(),
+                msg_id,
+                name_display: link_text.clone(),
+                state: DownloadState::AwaitingConfirmation,
+                link: message_link.clone(),
+                size_bytes: file_size,
+                file_name: file_name_prefix.clone(),
+                file_id: Some(file_id.clone()),
+                confirmation_msg_ids: confirmation_msg_id,
+            }))
+            .await;
 
         return Ok(());
     }
@@ -511,6 +520,7 @@ async fn file_handler(
             size_bytes: file_size,
             file_name: file_name_prefix.clone(),
             file_id: Some(file_id.clone()),
+            confirmation_msg_ids: vec![],
         }))
         .await;
 
@@ -521,6 +531,7 @@ async fn callback_handler(
     q: CallbackQuery,
     senders: SenderMap,
     bot: Bot,
+    config: Config,
 ) -> ResponseResult<()> {
     if let Some(data) = &q.data {
         let chat_id = match &q.message {
@@ -528,19 +539,30 @@ async fn callback_handler(
             _ => return Ok(()),
         };
 
-        if data == "clear_errors" {
-            let map = senders.lock().await;
+        // Get or create actor channel
+        let tx = {
+            let mut map = senders.lock().await;
             if let Some(tx) = map.get(&chat_id) {
-                let _ = tx.send(DownloadEvent::ClearErrors).await;
+                tx.clone()
+            } else {
+                // Spawn new Actor (needed after restart when old buttons are clicked)
+                let (tx, rx) = mpsc::channel(100);
+                map.insert(chat_id, tx.clone());
+                let bot_clone = bot.clone();
+                let config_clone = config.clone();
+                let tx_for_actor = tx.clone();
+                tokio::spawn(run_ui_actor(bot_clone, chat_id, rx, tx_for_actor, config_clone));
+                tx
             }
+        };
+
+        if data == "clear_errors" {
+            let _ = tx.send(DownloadEvent::ClearErrors).await;
             bot.answer_callback_query(q.id)
                 .text("Errors cleared")
                 .await?;
         } else if data == "resend_confirmations" {
-            let map = senders.lock().await;
-            if let Some(tx) = map.get(&chat_id) {
-                let _ = tx.send(DownloadEvent::ResendConfirmations).await;
-            }
+            let _ = tx.send(DownloadEvent::ResendConfirmations).await;
             bot.answer_callback_query(q.id)
                 .text("Resending confirmations...")
                 .await?;
@@ -548,10 +570,7 @@ async fn callback_handler(
             if let Ok(msg_id_val) = msg_id_str.parse::<i32>() {
                 let msg_id = MessageId(msg_id_val);
                 // User confirmed large file download
-                let map = senders.lock().await;
-                if let Some(tx) = map.get(&chat_id) {
-                    let _ = tx.send(DownloadEvent::UserConfirmed(msg_id)).await;
-                }
+                let _ = tx.send(DownloadEvent::UserConfirmed(msg_id)).await;
 
                 bot.answer_callback_query(q.id)
                     .text("Download started...")
@@ -568,10 +587,7 @@ async fn callback_handler(
             if let Ok(msg_id_val) = msg_id_str.parse::<i32>() {
                 let msg_id = MessageId(msg_id_val);
                 // User cancelled large file download
-                let map = senders.lock().await;
-                if let Some(tx) = map.get(&chat_id) {
-                    let _ = tx.send(DownloadEvent::UserCancelled(msg_id)).await;
-                }
+                let _ = tx.send(DownloadEvent::UserCancelled(msg_id)).await;
 
                 bot.answer_callback_query(q.id)
                     .text("Download cancelled")
@@ -681,7 +697,26 @@ async fn run_ui_actor(
                         match e {
                             DownloadEvent::TaskAdded(t) => {
                                 let is_awaiting = matches!(t.state, DownloadState::AwaitingConfirmation);
-                                tasks.push_back(t);
+                                let mut is_duplicate = false;
+
+                                // Check for duplicates if awaiting confirmation
+                                if is_awaiting && t.file_id.is_some() {
+                                    let file_id = t.file_id.as_ref().unwrap();
+                                    // Find existing task with same file_id in awaiting confirmation state
+                                    if let Some(existing) = tasks.iter_mut().find(|task|
+                                        matches!(task.state, DownloadState::AwaitingConfirmation) &&
+                                        task.file_id.as_ref() == Some(file_id)
+                                    ) {
+                                        // Add new confirmation message IDs to existing task
+                                        existing.confirmation_msg_ids.extend(t.confirmation_msg_ids.iter().cloned());
+                                        is_duplicate = true;
+                                    }
+                                }
+
+                                if !is_duplicate {
+                                    tasks.push_back(t);
+                                }
+
                                 if is_awaiting {
                                     save_queue(chat_id, &tasks).await;
                                 }
@@ -751,20 +786,35 @@ async fn run_ui_actor(
                                 // User confirmed download - find the task and set to Queued
                                 // The loop will pick it up
                                 if let Some(t) = tasks.iter_mut().find(|x| x.msg_id == mid && x.state == DownloadState::AwaitingConfirmation) {
+                                    // Delete all other confirmation messages for this file
+                                    for &old_msg_id in &t.confirmation_msg_ids {
+                                        let _ = bot.delete_message(chat_id, old_msg_id).await;
+                                    }
+                                    t.confirmation_msg_ids.clear();
                                     t.state = DownloadState::Queued;
                                     save_queue(chat_id, &tasks).await;
                                 }
                             },
                             DownloadEvent::UserCancelled(mid) => {
                                 if let Some(pos) = tasks.iter().position(|x| x.msg_id == mid && x.state == DownloadState::AwaitingConfirmation) {
+                                    // Delete all confirmation messages before removing task
+                                    for &old_msg_id in &tasks[pos].confirmation_msg_ids {
+                                        let _ = bot.delete_message(chat_id, old_msg_id).await;
+                                    }
                                     tasks.remove(pos);
                                     save_queue(chat_id, &tasks).await;
                                 }
                             },
                             DownloadEvent::ResendConfirmations => {
                                 // Resend confirmation prompts for all tasks awaiting confirmation
-                                for task in tasks.iter() {
+                                for task in tasks.iter_mut() {
                                     if task.state == DownloadState::AwaitingConfirmation {
+                                        // Delete old confirmation messages
+                                        for old_msg_id in &task.confirmation_msg_ids {
+                                            let _ = bot.delete_message(chat_id, *old_msg_id).await;
+                                        }
+                                        task.confirmation_msg_ids.clear();
+
                                         let confirm_text = if !task.link.is_empty() {
                                             format!(
                                                 "⚠️ <a href=\"{}\">File</a> is large ({}).\n\
@@ -789,14 +839,19 @@ async fn run_ui_actor(
                                             InlineKeyboardButton::callback("❌ Cancel", format!("cancel_download:{}", task.msg_id)),
                                         ]]);
 
-                                        let _ = bot
+                                        let res = bot
                                             .send_message(chat_id, confirm_text)
                                             .parse_mode(ParseMode::Html)
                                             .reply_parameters(ReplyParameters::new(task.msg_id))
                                             .reply_markup(keyboard)
                                             .await;
+
+                                        if let Ok(sent_msg) = res {
+                                            task.confirmation_msg_ids.push(sent_msg.id);
+                                        }
                                     }
                                 }
+                                save_queue(chat_id, &tasks).await;
                             }
                         }
                     }
