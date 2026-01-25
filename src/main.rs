@@ -10,8 +10,8 @@ use teloxide::{
     net::Download,
     prelude::*,
     types::{
-        FileId, InlineKeyboardButton, InlineKeyboardMarkup, MaybeInaccessibleMessage, MessageId,
-        MessageOrigin, ParseMode, ReplyParameters, UserId,
+        BotCommand, FileId, InlineKeyboardButton, InlineKeyboardMarkup, MaybeInaccessibleMessage,
+        MessageId, MessageOrigin, ParseMode, ReplyParameters, UserId,
     },
 };
 use tokio::fs;
@@ -228,6 +228,15 @@ async fn main() {
     let bot_user = bot.get_me().await.expect("Failed to get bot info");
     let bot_id = bot_user.id;
     log::info!("Bot ID: {}", bot_id);
+
+    // Set bot commands
+    let commands = vec![
+        BotCommand::new("start", "Show download queue status"),
+    ];
+    match bot.set_my_commands(commands).await {
+        Ok(_) => log::info!("Bot commands set successfully"),
+        Err(e) => log::warn!("Failed to set bot commands: {}", e),
+    }
 
     // Create destination folder from config
     fs::create_dir_all(&config.destination)
