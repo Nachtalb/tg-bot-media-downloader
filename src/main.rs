@@ -425,7 +425,7 @@ async fn file_handler(
                 format!(
                     "❌ <b>Error:</b> {} is too large ({}).\n\
                     Maximum file size in local mode is {}.",
-                    link_text,
+                    escape_html(&link_text),
                     format_size(file_size),
                     format_size(MAX_FILE_SIZE_LOCAL_CONFIRM)
                 )
@@ -471,7 +471,7 @@ async fn file_handler(
             } else {
                 format!(
                     "❌ <b>Error:</b> {} is too large ({}).",
-                    link_text,
+                    escape_html(&link_text),
                     format_size(file_size)
                 )
             };
@@ -500,7 +500,7 @@ async fn file_handler(
             format!(
                 "⚠️ {} is large ({}).\n\
                 Download may take time. Continue?",
-                link_text,
+                escape_html(&link_text),
                 format_size(file_size)
             )
         };
@@ -783,15 +783,17 @@ async fn run_ui_actor(
                                     active_downloads = active_downloads.saturating_sub(1);
 
                                     // Send a static error message
+                                    let escaped_name = escape_html(&t.file_name);
+                                    let escaped_err = escape_html(&err);
                                     let error_text = if !t.link.is_empty() {
                                         format!(
                                             "❌ <b>Download Failed:</b> <a href=\"{}\">{}</a>\n<b>Error:</b> {}",
-                                            t.link, t.file_name, err
+                                            t.link, escaped_name, escaped_err
                                         )
                                     } else {
                                         format!(
                                             "❌ <b>Download Failed:</b> {}\n<b>Error:</b> {}",
-                                            t.file_name, err
+                                            escaped_name, escaped_err
                                         )
                                     };
 
@@ -865,7 +867,7 @@ async fn run_ui_actor(
                                             format!(
                                                 "⚠️ {} is large ({}).\n\
                                                 Download may take time. Continue?",
-                                                task.name_display,
+                                                escape_html(&task.name_display),
                                                 format_size(task.size_bytes)
                                             )
                                         };
@@ -993,6 +995,12 @@ async fn send_new(
 
 // --- Helpers ---
 
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn build_message_link(msg: &Message, bot_id: UserId, offset: i32) -> String {
     // Try to get the public URL first (for groups/channels)
     if let Some(url) = msg.url() {
@@ -1092,10 +1100,11 @@ fn generate_status_text(
         let size_str = format_size(task.size_bytes);
 
         // Always create a link if we have a message link
+        let escaped_name = escape_html(&task.name_display);
         let link_html = if !task.link.is_empty() {
-            format!("<a href=\"{}\">{}</a>", task.link, task.name_display)
+            format!("<a href=\"{}\">{}</a>", task.link, escaped_name)
         } else {
-            task.name_display.clone()
+            escaped_name
         };
 
         match &task.state {
@@ -1125,7 +1134,7 @@ fn generate_status_text(
                 // Show error message in the status
                 text.push_str(&format!(
                     "❌ <code>[{}]</code> {} \n   <i>{}</i>\n",
-                    size_str, link_html, err_msg
+                    size_str, link_html, escape_html(err_msg)
                 ));
             }
         }
