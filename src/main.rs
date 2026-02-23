@@ -1090,11 +1090,21 @@ fn generate_status_text(
         .filter(|t| matches!(t.state, DownloadState::Done))
         .count();
 
-    for (i, task) in tasks.iter().enumerate() {
+    // Sort tasks so active downloads appear first, completed/errored ones at the bottom
+    let mut sorted_tasks: Vec<&FileTask> = tasks.iter().collect();
+    sorted_tasks.sort_by_key(|t| match t.state {
+        DownloadState::Downloading => 0,
+        DownloadState::AwaitingConfirmation => 1,
+        DownloadState::Queued => 2,
+        DownloadState::Error(_) => 3,
+        DownloadState::Done => 4,
+    });
+
+    for (i, task) in sorted_tasks.iter().enumerate() {
         if i >= max_lines {
             text.push_str(&format!(
                 "\n<i>... and {} more</i>",
-                tasks.len() - max_lines
+                sorted_tasks.len() - max_lines
             ));
             break;
         }
