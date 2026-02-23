@@ -1208,7 +1208,31 @@ async fn download_file_logic(
         }
     }
 
-    let file_name = format!("{}_{}.{}", name_prefix, file_id.0, extension);
+    // Build filename, ensuring it stays within 255-byte filesystem limit.
+    // Truncate file_id (keeping the tail which has most entropy) and prefix as needed.
+    let ext_part = if extension.is_empty() {
+        String::new()
+    } else {
+        format!(".{}", extension)
+    };
+    let max_name_len: usize = 255;
+    let separator_len = 1; // the '_' between prefix and id
+    let available = max_name_len.saturating_sub(ext_part.len()).saturating_sub(separator_len);
+    // Reserve at least 20 chars for file_id tail
+    let min_id_len: usize = 20;
+    let id_str = &file_id.0;
+    let (used_prefix, used_id) = if available < min_id_len + 1 {
+        // Extremely long extension; just use truncated id
+        let id_take = available.min(id_str.len());
+        ("", &id_str[id_str.len().saturating_sub(id_take)..])
+    } else {
+        let max_prefix = available - min_id_len.min(id_str.len());
+        let prefix_take = max_prefix.min(name_prefix.len());
+        let id_budget = available - prefix_take;
+        let id_take = id_budget.min(id_str.len());
+        (&name_prefix[..prefix_take], &id_str[id_str.len().saturating_sub(id_take)..])
+    };
+    let file_name = format!("{}_{}{}", used_prefix, used_id, ext_part);
     let destination = format!("{}/{}", final_dir, file_name);
 
     // Check if file already exists
