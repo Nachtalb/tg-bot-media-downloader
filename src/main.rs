@@ -37,7 +37,7 @@ struct Config {
     max_concurrent_downloads: usize,
 
     /// Create date-based subfolders (e.g., downloads/2023-10-27/)
-    #[clap(long, default_value_t = true)]
+    #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
     date_subfolders: bool,
 
     /// Use local Bot API server mode
