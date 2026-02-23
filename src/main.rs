@@ -360,6 +360,8 @@ async fn file_handler(
         )
     } else if let Some(vn) = msg.video_note() {
         (vn.file.id.clone(), "video_note".to_string(), vn.file.size)
+    } else if let Some(sticker) = msg.sticker() {
+        (sticker.file.id.clone(), "sticker".to_string(), sticker.file.size)
     } else {
         return Ok(());
     };
