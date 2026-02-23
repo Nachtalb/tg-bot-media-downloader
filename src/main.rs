@@ -393,7 +393,7 @@ async fn file_handler(
     let message_link = build_message_link(&msg, bot_id, config.message_id_offset);
 
     // Determine max file size based on mode
-    let (_max_size, needs_confirmation) = if config.local_mode {
+    let needs_confirmation = if config.local_mode {
         if file_size > MAX_FILE_SIZE_LOCAL_CONFIRM {
             // Exceeds absolute maximum
             let _ = tx
@@ -440,10 +440,10 @@ async fn file_handler(
             return Ok(());
         } else if file_size > MAX_FILE_SIZE_LOCAL {
             // Requires confirmation
-            (MAX_FILE_SIZE_LOCAL_CONFIRM, true)
+            true
         } else {
             // Within auto-download limit
-            (MAX_FILE_SIZE_LOCAL, false)
+            false
         }
     } else {
         // Standard mode - 20MB limit
@@ -484,7 +484,7 @@ async fn file_handler(
 
             return Ok(());
         }
-        (MAX_FILE_SIZE, false)
+        false
     };
 
     // If needs confirmation, send message with button
