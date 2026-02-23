@@ -282,6 +282,33 @@ async fn main() {
         .await;
 }
 
+// --- Helpers for actor management ---
+
+async fn get_or_create_actor(
+    senders: &SenderMap,
+    bot: &Bot,
+    chat_id: ChatId,
+    config: &Config,
+) -> mpsc::Sender<DownloadEvent> {
+    let mut map = senders.lock().await;
+    if let Some(tx) = map.get(&chat_id) {
+        if !tx.is_closed() {
+            return tx.clone();
+        }
+        // Channel is closed (actor died), remove stale entry
+        map.remove(&chat_id);
+    }
+    // Spawn new actor
+    let (tx, rx) = mpsc::channel(100);
+    map.insert(chat_id, tx.clone());
+    let bot_clone = bot.clone();
+    let config_clone = config.clone();
+    let tx_for_actor = tx.clone();
+    let senders_clone = senders.clone();
+    tokio::spawn(run_ui_actor(bot_clone, chat_id, rx, tx_for_actor, config_clone, senders_clone));
+    tx
+}
+
 // --- Handlers ---
 
 async fn file_handler(
@@ -295,22 +322,7 @@ async fn file_handler(
     if let Some(text) = msg.text() {
         if text.starts_with("/start") {
             let chat_id = msg.chat.id;
-            // Get or create actor channel
-            let tx = {
-                let mut map = senders.lock().await;
-                if let Some(tx) = map.get(&chat_id) {
-                    tx.clone()
-                } else {
-                    // Spawn new Actor
-                    let (tx, rx) = mpsc::channel(100);
-                    map.insert(chat_id, tx.clone());
-                    let bot_clone = bot.clone();
-                    let config_clone = config.clone();
-                    let tx_for_actor = tx.clone();
-                    tokio::spawn(run_ui_actor(bot_clone, chat_id, rx, tx_for_actor, config_clone));
-                    tx
-                }
-            };
+            let tx = get_or_create_actor(&senders, &bot, chat_id, &config).await;
 
             // Request status refresh
             let _ = tx.send(DownloadEvent::RefreshStatus).await;
@@ -371,21 +383,7 @@ async fn file_handler(
     let task_id = format!("{}_{}", msg_id, file_id.0);
 
     // 2. Get or Create Actor Channel
-    let tx = {
-        let mut map = senders.lock().await;
-        if let Some(tx) = map.get(&chat_id) {
-            tx.clone()
-        } else {
-            // Spawn new Actor
-            let (tx, rx) = mpsc::channel(100);
-            map.insert(chat_id, tx.clone());
-            let bot_clone = bot.clone();
-            let config_clone = config.clone();
-            let tx_for_actor = tx.clone(); // Clone for actor to use when spawning downloads
-            tokio::spawn(run_ui_actor(bot_clone, chat_id, rx, tx_for_actor, config_clone));
-            tx
-        }
-    };
+    let tx = get_or_create_actor(&senders, &bot, chat_id, &config).await;
 
     // 3. Notify Actor of new user message
     let _ = tx.send(DownloadEvent::UserMessageSent(msg_id)).await;
@@ -577,22 +575,8 @@ async fn callback_handler(
             _ => return Ok(()),
         };
 
-        // Get or create actor channel
-        let tx = {
-            let mut map = senders.lock().await;
-            if let Some(tx) = map.get(&chat_id) {
-                tx.clone()
-            } else {
-                // Spawn new Actor (needed after restart when old buttons are clicked)
-                let (tx, rx) = mpsc::channel(100);
-                map.insert(chat_id, tx.clone());
-                let bot_clone = bot.clone();
-                let config_clone = config.clone();
-                let tx_for_actor = tx.clone();
-                tokio::spawn(run_ui_actor(bot_clone, chat_id, rx, tx_for_actor, config_clone));
-                tx
-            }
-        };
+        // Get or create actor channel (needed after restart when old buttons are clicked)
+        let tx = get_or_create_actor(&senders, &bot, chat_id, &config).await;
 
         if data == "clear_errors" {
             let _ = tx.send(DownloadEvent::ClearErrors).await;
@@ -651,6 +635,7 @@ async fn run_ui_actor(
     mut rx: mpsc::Receiver<DownloadEvent>,
     tx: mpsc::Sender<DownloadEvent>,
     config: Config,
+    senders: SenderMap,
 ) {
     // Local State (No Mutex needed! Single thread ownership)
     let mut tasks: VecDeque<FileTask> = load_queue(chat_id).await;
@@ -932,6 +917,10 @@ async fn run_ui_actor(
             }
         }
     }
+
+    // Clean up: remove this actor's sender from the global map
+    senders.lock().await.remove(&chat_id);
+    log::info!("Actor for chat {} shut down and cleaned up", chat_id);
 }
 
 async fn update_ui(
