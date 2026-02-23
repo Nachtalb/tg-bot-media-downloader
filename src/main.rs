@@ -692,7 +692,7 @@ async fn run_ui_actor(
                 let msg_id = t.msg_id;
                 let chat_id = chat_id;
 
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     let _ = tx_dl.send(DownloadEvent::TaskStarted(task_id.clone())).await;
 
                     match download_file_logic(
@@ -719,6 +719,22 @@ async fn run_ui_actor(
                                 .send(DownloadEvent::TaskError(task_id.clone(), e.to_string()))
                                 .await;
                         }
+                    }
+                });
+
+                // Monitor the task handle to catch panics
+                let tx_panic = tx.clone();
+                let panic_task_id = t.id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle.await {
+                        let err_msg = if e.is_panic() {
+                            "Download task panicked".to_string()
+                        } else {
+                            format!("Download task cancelled: {}", e)
+                        };
+                        let _ = tx_panic
+                            .send(DownloadEvent::TaskError(panic_task_id, err_msg))
+                            .await;
                     }
                 });
             } else {
