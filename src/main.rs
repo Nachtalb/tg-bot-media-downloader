@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use chrono::Local;
+use chrono::{DateTime, Local};
 use teloxide::{
     net::Download,
     prelude::*,
@@ -232,6 +232,7 @@ async fn main() {
     // Set bot commands
     let commands = vec![
         BotCommand::new("start", "Show download queue status"),
+        BotCommand::new("uptime", "Show bot uptime"),
     ];
     match bot.set_my_commands(commands).await {
         Ok(_) => log::info!("Bot commands set successfully"),
@@ -263,6 +264,8 @@ async fn main() {
         }
     }
 
+    let start_time = Local::now();
+
     // We only store the senders. The state is owned by the spawned actors.
     let senders: SenderMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -274,7 +277,7 @@ async fn main() {
         .branch(callback_handler);
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![senders, config, bot_id])
+        .dependencies(dptree::deps![senders, config, bot_id, start_time])
         .distribution_function(|_| None::<()>)
         .enable_ctrlc_handler()
         .build()
@@ -317,8 +320,9 @@ async fn file_handler(
     senders: SenderMap,
     config: Config,
     bot_id: UserId,
+    start_time: DateTime<Local>,
 ) -> ResponseResult<()> {
-    // Check for /start command
+    // Check for commands
     if let Some(text) = msg.text() {
         if text.starts_with("/start") {
             let chat_id = msg.chat.id;
@@ -326,6 +330,37 @@ async fn file_handler(
 
             // Request status refresh
             let _ = tx.send(DownloadEvent::RefreshStatus).await;
+            return Ok(());
+        } else if text.starts_with("/uptime") {
+            let now = Local::now();
+            let duration = now.signed_duration_since(start_time);
+            let total_secs = duration.num_seconds();
+            let days = total_secs / 86400;
+            let hours = (total_secs % 86400) / 3600;
+            let minutes = (total_secs % 3600) / 60;
+            let seconds = total_secs % 60;
+
+            let uptime_str = if days > 0 {
+                format!("{}d {}h {}m {}s", days, hours, minutes, seconds)
+            } else if hours > 0 {
+                format!("{}h {}m {}s", hours, minutes, seconds)
+            } else if minutes > 0 {
+                format!("{}m {}s", minutes, seconds)
+            } else {
+                format!("{}s", seconds)
+            };
+
+            let reply = format!(
+                "🤖 <b>Bot Uptime</b>\n\n\
+                 🕐 <b>Started:</b> {}\n\
+                 ⏱ <b>Uptime:</b> {}",
+                start_time.format("%Y-%m-%d %H:%M:%S"),
+                uptime_str
+            );
+
+            bot.send_message(msg.chat.id, reply)
+                .parse_mode(ParseMode::Html)
+                .await?;
             return Ok(());
         }
     }
