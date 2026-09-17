@@ -1307,7 +1307,6 @@ async fn download_file_logic(
         match fs::rename(&file_path, &destination).await {
             Ok(_) => {
                 log::info!("File moved successfully");
-                Ok(true)
             }
             Err(e) => {
                 // Check for cross-device link error (EXDEV = 18 on Linux)
@@ -1322,13 +1321,238 @@ async fn download_file_logic(
                 fs::copy(&file_path, &destination).await?;
                 // Optionally delete the original
                 let _ = fs::remove_file(&file_path).await;
-                Ok(true)
             }
         }
     } else {
         // Standard mode: download from Telegram servers
         let mut dest_file = fs::File::create(&destination).await?;
         bot.download_file(&file.path, &mut dest_file).await?;
-        Ok(true)
+    }
+
+    // Telegram trusts the sender's file name, so the extension can lie about the
+    // content (a .jpg that is an MP4, an .mp4 that is an MPEG-TS stream, ...).
+    fix_media_container(&destination).await;
+    Ok(true)
+}
+
+/// Media container detected from the first bytes of a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaContainer {
+    Jpeg,
+    Png,
+    Gif,
+    Webp,
+    Avi,
+    Heic,
+    Avif,
+    Mov,
+    Mp4,
+    Webm,
+    Mkv,
+    MpegTs,
+}
+
+impl MediaContainer {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpg",
+            Self::Png => "png",
+            Self::Gif => "gif",
+            Self::Webp => "webp",
+            Self::Avi => "avi",
+            Self::Heic => "heic",
+            Self::Avif => "avif",
+            Self::Mov => "mov",
+            Self::Mp4 | Self::MpegTs => "mp4",
+            Self::Webm => "webm",
+            Self::Mkv => "mkv",
+        }
+    }
+
+    /// Whether `ext` is an acceptable file extension for this container.
+    /// mov/mp4/m4v are all ISO base media files that players handle regardless
+    /// of the name, so they are never renamed between each other.
+    fn accepts(self, ext: &str) -> bool {
+        let ext = ext.to_ascii_lowercase();
+        match self {
+            Self::Jpeg => matches!(ext.as_str(), "jpg" | "jpeg" | "jpe"),
+            Self::Mov | Self::Mp4 => matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "m4a" | "3gp"),
+            Self::Heic => matches!(ext.as_str(), "heic" | "heif"),
+            Self::MpegTs => false,
+            other => ext == other.extension(),
+        }
+    }
+}
+
+/// Identify the container from the first bytes of a file (at least 377 bytes
+/// are needed to recognise MPEG-TS by its 188-byte packet sync bytes).
+fn sniff_media(head: &[u8]) -> Option<MediaContainer> {
+    if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some(MediaContainer::Jpeg);
+    }
+    if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some(MediaContainer::Png);
+    }
+    if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        return Some(MediaContainer::Gif);
+    }
+    if head.starts_with(b"RIFF") && head.len() >= 12 {
+        return match &head[8..12] {
+            b"WEBP" => Some(MediaContainer::Webp),
+            b"AVI " => Some(MediaContainer::Avi),
+            _ => None,
+        };
+    }
+    if head.len() >= 12 && &head[4..8] == b"ftyp" {
+        let brand: [u8; 4] = head[8..12].try_into().unwrap_or([0; 4]);
+        return Some(match &brand {
+            b"heic" | b"heix" | b"hevc" | b"hevx" | b"mif1" | b"msf1" | b"heim" | b"heis" => {
+                MediaContainer::Heic
+            }
+            b"avif" => MediaContainer::Avif,
+            b"qt  " => MediaContainer::Mov,
+            _ => MediaContainer::Mp4,
+        });
+    }
+    if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        let is_webm = head.windows(4).any(|w| w == b"webm");
+        return Some(if is_webm { MediaContainer::Webm } else { MediaContainer::Mkv });
+    }
+    if head.len() >= 377 && head[0] == 0x47 && head[188] == 0x47 && head[376] == 0x47 {
+        return Some(MediaContainer::MpegTs);
+    }
+    None
+}
+
+async fn read_head(path: &str) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut file = fs::File::open(path).await?;
+    let mut buf = vec![0u8; 512];
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = file.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
+/// Give a downloaded file the extension that matches its real content, and
+/// remux MPEG-TS streams (which browsers cannot play) into proper MP4 files.
+/// Failures only log a warning; the download itself is already complete.
+async fn fix_media_container(path: &str) {
+    let head = match read_head(path).await {
+        Ok(head) => head,
+        Err(e) => {
+            log::warn!("Could not read {} to check its container: {}", path, e);
+            return;
+        }
+    };
+    let Some(container) = sniff_media(&head) else {
+        return;
+    };
+
+    if container == MediaContainer::MpegTs {
+        if let Err(e) = remux_to_mp4(path).await {
+            log::warn!("Could not remux MPEG-TS file {} to MP4: {}", path, e);
+        }
+        return;
+    }
+
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if container.accepts(ext) {
+        return;
+    }
+    let target = Path::new(path).with_extension(container.extension());
+    if fs::metadata(&target).await.is_ok() {
+        log::warn!(
+            "{} is really {:?} but {} already exists; leaving the name as is",
+            path,
+            container,
+            target.display()
+        );
+        return;
+    }
+    match fs::rename(path, &target).await {
+        Ok(_) => log::info!(
+            "Renamed {} -> .{} (content is {:?}, extension was .{})",
+            path,
+            container.extension(),
+            container,
+            ext
+        ),
+        Err(e) => log::warn!("Could not rename {} to {}: {}", path, target.display(), e),
+    }
+}
+
+/// Stream-copy an MPEG-TS file into an MP4 container with ffmpeg (no re-encoding),
+/// then replace the original with it.
+async fn remux_to_mp4(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let source = Path::new(path);
+    let final_path = source.with_extension("mp4");
+    let tmp_path = source.with_extension("remux.tmp.mp4");
+    if final_path != source && fs::metadata(&final_path).await.is_ok() {
+        return Err(format!("{} already exists", final_path.display()).into());
+    }
+
+    let status = tokio::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-fflags", "+genpts", "-i"])
+        .arg(source)
+        .args(["-map", "0", "-c", "copy", "-movflags", "+faststart"])
+        .arg(&tmp_path)
+        .status()
+        .await?;
+    if !status.success() {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(format!("ffmpeg exited with {}", status).into());
+    }
+
+    fs::remove_file(source).await?;
+    fs::rename(&tmp_path, &final_path).await?;
+    log::info!("Remuxed MPEG-TS {} -> {}", path, final_path.display());
+    Ok(())
+}
+
+#[cfg(test)]
+mod media_container_tests {
+    use super::*;
+
+    fn ts_packets() -> Vec<u8> {
+        let mut v = vec![0u8; 512];
+        for i in [0, 188, 376] {
+            v[i] = 0x47;
+        }
+        v
+    }
+
+    #[test]
+    fn detects_common_containers() {
+        assert_eq!(sniff_media(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]), Some(MediaContainer::Jpeg));
+        assert_eq!(sniff_media(b"\x89PNG\r\n\x1a\n...."), Some(MediaContainer::Png));
+        assert_eq!(sniff_media(b"RIFF\0\0\0\0WEBPVP8 "), Some(MediaContainer::Webp));
+        assert_eq!(sniff_media(b"\0\0\0\x18ftypisom\0\0\0\x01isomiso4"), Some(MediaContainer::Mp4));
+        assert_eq!(sniff_media(b"\0\0\0\x14ftypqt  \0\0\0\0qt  "), Some(MediaContainer::Mov));
+        assert_eq!(sniff_media(b"\0\0\0\x18ftypheic\0\0\0\0mif1heic"), Some(MediaContainer::Heic));
+        assert_eq!(sniff_media(b"\x1a\x45\xdf\xa3\x01\0\0\0\0\0\0\x1f\x42\x86\x81\x01\x42\x82\x84webm"), Some(MediaContainer::Webm));
+        assert_eq!(sniff_media(&ts_packets()), Some(MediaContainer::MpegTs));
+        assert_eq!(sniff_media(b"<?xpacket begin="), None);
+        assert_eq!(sniff_media(b""), None);
+    }
+
+    #[test]
+    fn iso_family_names_are_interchangeable() {
+        assert!(MediaContainer::Mp4.accepts("MOV"));
+        assert!(MediaContainer::Mov.accepts("mp4"));
+        assert!(MediaContainer::Mp4.accepts("m4v"));
+        assert!(MediaContainer::Jpeg.accepts("jpeg"));
+        assert!(!MediaContainer::Mp4.accepts("jpg"));
+        assert!(!MediaContainer::Webp.accepts("jpg"));
+        assert!(!MediaContainer::MpegTs.accepts("mp4"));
     }
 }
