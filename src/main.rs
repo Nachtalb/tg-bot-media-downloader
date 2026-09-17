@@ -1370,17 +1370,19 @@ impl MediaContainer {
     }
 
     /// Whether `ext` is an acceptable file extension for this container.
-    /// mov/mp4/m4v are all ISO base media files that players handle regardless
-    /// of the name, so they are never renamed between each other.
+    /// Videos are only ever kept as .mp4 or .webm.
     fn accepts(self, ext: &str) -> bool {
         let ext = ext.to_ascii_lowercase();
         match self {
             Self::Jpeg => matches!(ext.as_str(), "jpg" | "jpeg" | "jpe"),
-            Self::Mov | Self::Mp4 => matches!(ext.as_str(), "mp4" | "mov" | "m4v" | "m4a" | "3gp"),
             Self::Heic => matches!(ext.as_str(), "heic" | "heif"),
-            Self::MpegTs => false,
             other => ext == other.extension(),
         }
+    }
+
+    /// Video containers that are converted (stream copy) into mp4 or webm.
+    fn needs_remux(self) -> bool {
+        matches!(self, Self::Mov | Self::Mkv | Self::Avi | Self::MpegTs)
     }
 }
 
@@ -1455,9 +1457,9 @@ async fn fix_media_container(path: &str) {
         return;
     };
 
-    if container == MediaContainer::MpegTs {
-        if let Err(e) = remux_to_mp4(path).await {
-            log::warn!("Could not remux MPEG-TS file {} to MP4: {}", path, e);
+    if container.needs_remux() {
+        if let Err(e) = remux_video(path).await {
+            log::warn!("Could not remux {:?} file {} to mp4/webm: {}", container, path, e);
         }
         return;
     }
@@ -1491,32 +1493,40 @@ async fn fix_media_container(path: &str) {
     }
 }
 
-/// Stream-copy an MPEG-TS file into an MP4 container with ffmpeg (no re-encoding),
-/// then replace the original with it.
-async fn remux_to_mp4(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// Stream-copy a video into an MP4 container (falling back to WebM when the codecs are
+/// only WebM-compatible) with ffmpeg, no re-encoding, then replace the original with it.
+async fn remux_video(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let source = Path::new(path);
-    let final_path = source.with_extension("mp4");
-    let tmp_path = source.with_extension("remux.tmp.mp4");
-    if final_path != source && fs::metadata(&final_path).await.is_ok() {
-        return Err(format!("{} already exists", final_path.display()).into());
+    let mut errors = Vec::new();
+    for fmt in ["mp4", "webm"] {
+        let final_path = source.with_extension(fmt);
+        // On case-insensitive filesystems `X.MP4` and `X.mp4` are the same file.
+        let same_file = final_path.to_string_lossy().to_lowercase() == path.to_lowercase();
+        if !same_file && fs::metadata(&final_path).await.is_ok() {
+            errors.push(format!("{} already exists", final_path.display()));
+            continue;
+        }
+        let tmp_path = source.with_extension(format!("remux.tmp.{}", fmt));
+        let mut cmd = tokio::process::Command::new("ffmpeg");
+        cmd.args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-fflags", "+genpts", "-i"])
+            .arg(source)
+            // Keep video and audio only: timecode/data tracks cannot live in mp4/webm.
+            .args(["-map", "0:v", "-map", "0:a?", "-dn", "-c", "copy"]);
+        if fmt == "mp4" {
+            cmd.args(["-movflags", "+faststart"]);
+        }
+        let status = cmd.arg(&tmp_path).status().await?;
+        if !status.success() {
+            let _ = fs::remove_file(&tmp_path).await;
+            errors.push(format!("{}: ffmpeg exited with {}", fmt, status));
+            continue;
+        }
+        fs::remove_file(source).await?;
+        fs::rename(&tmp_path, &final_path).await?;
+        log::info!("Remuxed {} -> {}", path, final_path.display());
+        return Ok(());
     }
-
-    let status = tokio::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-fflags", "+genpts", "-i"])
-        .arg(source)
-        .args(["-map", "0", "-c", "copy", "-movflags", "+faststart"])
-        .arg(&tmp_path)
-        .status()
-        .await?;
-    if !status.success() {
-        let _ = fs::remove_file(&tmp_path).await;
-        return Err(format!("ffmpeg exited with {}", status).into());
-    }
-
-    fs::remove_file(source).await?;
-    fs::rename(&tmp_path, &final_path).await?;
-    log::info!("Remuxed MPEG-TS {} -> {}", path, final_path.display());
-    Ok(())
+    Err(errors.join(" | ").into())
 }
 
 #[cfg(test)]
@@ -1546,13 +1556,18 @@ mod media_container_tests {
     }
 
     #[test]
-    fn iso_family_names_are_interchangeable() {
-        assert!(MediaContainer::Mp4.accepts("MOV"));
-        assert!(MediaContainer::Mov.accepts("mp4"));
-        assert!(MediaContainer::Mp4.accepts("m4v"));
+    fn videos_are_only_kept_as_mp4_or_webm() {
+        assert!(MediaContainer::Mp4.accepts("MP4"));
+        assert!(!MediaContainer::Mp4.accepts("mov"));
+        assert!(!MediaContainer::Mp4.accepts("m4v"));
+        assert!(MediaContainer::Webm.accepts("webm"));
         assert!(MediaContainer::Jpeg.accepts("jpeg"));
         assert!(!MediaContainer::Mp4.accepts("jpg"));
         assert!(!MediaContainer::Webp.accepts("jpg"));
-        assert!(!MediaContainer::MpegTs.accepts("mp4"));
+        for c in [MediaContainer::Mov, MediaContainer::Mkv, MediaContainer::Avi, MediaContainer::MpegTs] {
+            assert!(c.needs_remux(), "{:?}", c);
+        }
+        assert!(!MediaContainer::Mp4.needs_remux());
+        assert!(!MediaContainer::Webm.needs_remux());
     }
 }
