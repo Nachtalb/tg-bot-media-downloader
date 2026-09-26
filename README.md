@@ -54,3 +54,7 @@ cargo test
 ```
 
 The crop test runs ffmpeg on `tests/screenshot.jpg`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

@@ -2,6 +2,8 @@
 name = "downloader"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+authors = ["Nachtalb <na@nachtalb.io>"]
 
 [dependencies]
 autocrop = "0.1.1"
