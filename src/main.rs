@@ -19,6 +19,8 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::time;
 use url::Url;
 
+mod crop;
+
 // --- CLI Configuration ---
 
 #[derive(Parser, Debug, Clone)]
@@ -39,6 +41,10 @@ struct Config {
     /// Create date-based subfolders (e.g., downloads/2023-10-27/)
     #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
     date_subfolders: bool,
+
+    /// Crop screenshots down to their content (images, mp4/webm) after download
+    #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
+    autocrop: bool,
 
     /// Use local Bot API server mode
     #[clap(long)]
@@ -707,6 +713,7 @@ async fn run_ui_actor(
                 let dest_dir = config.destination.clone();
                 let local_mode = config.local_mode;
                 let date_subfolders = config.date_subfolders;
+                let autocrop = config.autocrop;
                 
                 let task_id = t.id.clone();
                 let file_id = t.file_id.clone().expect("Queued task missing file_id");
@@ -726,6 +733,7 @@ async fn run_ui_actor(
                         chat_id,
                         msg_id,
                         date_subfolders,
+                        autocrop,
                     )
                     .await
                     {
@@ -1234,6 +1242,7 @@ async fn download_file_logic(
     chat_id: ChatId,
     msg_id: MessageId,
     date_subfolders: bool,
+    autocrop: bool,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let file = bot.get_file(file_id.clone()).await?;
     let file_path = file.path.clone();
@@ -1331,7 +1340,14 @@ async fn download_file_logic(
 
     // Telegram trusts the sender's file name, so the extension can lie about the
     // content (a .jpg that is an MP4, an .mp4 that is an MPEG-TS stream, ...).
-    fix_media_container(&destination).await;
+    let final_path = fix_media_container(&destination).await;
+    if autocrop {
+        match crop::autocrop_file(&final_path).await {
+            Ok(true) => log::info!("Cropped {}", final_path.display()),
+            Ok(false) => {}
+            Err(e) => log::warn!("Could not autocrop {}: {}", final_path.display(), e),
+        }
+    }
     Ok(true)
 }
 
@@ -1445,23 +1461,26 @@ async fn read_head(path: &str) -> std::io::Result<Vec<u8>> {
 /// Give a downloaded file the extension that matches its real content, and
 /// remux MPEG-TS streams (which browsers cannot play) into proper MP4 files.
 /// Failures only log a warning; the download itself is already complete.
-async fn fix_media_container(path: &str) {
+async fn fix_media_container(path: &str) -> std::path::PathBuf {
     let head = match read_head(path).await {
         Ok(head) => head,
         Err(e) => {
             log::warn!("Could not read {} to check its container: {}", path, e);
-            return;
+            return Path::new(path).to_path_buf();
         }
     };
     let Some(container) = sniff_media(&head) else {
-        return;
+        return Path::new(path).to_path_buf();
     };
 
     if container.needs_remux() {
-        if let Err(e) = remux_video(path).await {
-            log::warn!("Could not remux {:?} file {} to mp4/webm: {}", container, path, e);
-        }
-        return;
+        return match remux_video(path).await {
+            Ok(remuxed) => remuxed,
+            Err(e) => {
+                log::warn!("Could not remux {:?} file {} to mp4/webm: {}", container, path, e);
+                Path::new(path).to_path_buf()
+            }
+        };
     }
 
     let ext = Path::new(path)
@@ -1469,7 +1488,7 @@ async fn fix_media_container(path: &str) {
         .and_then(|e| e.to_str())
         .unwrap_or("");
     if container.accepts(ext) {
-        return;
+        return Path::new(path).to_path_buf();
     }
     let target = Path::new(path).with_extension(container.extension());
     if fs::metadata(&target).await.is_ok() {
@@ -1479,23 +1498,29 @@ async fn fix_media_container(path: &str) {
             container,
             target.display()
         );
-        return;
+        return Path::new(path).to_path_buf();
     }
     match fs::rename(path, &target).await {
-        Ok(_) => log::info!(
-            "Renamed {} -> .{} (content is {:?}, extension was .{})",
-            path,
-            container.extension(),
-            container,
-            ext
-        ),
-        Err(e) => log::warn!("Could not rename {} to {}: {}", path, target.display(), e),
+        Ok(_) => {
+            log::info!(
+                "Renamed {} -> .{} (content is {:?}, extension was .{})",
+                path,
+                container.extension(),
+                container,
+                ext
+            );
+            target
+        }
+        Err(e) => {
+            log::warn!("Could not rename {} to {}: {}", path, target.display(), e);
+            Path::new(path).to_path_buf()
+        }
     }
 }
 
 /// Stream-copy a video into an MP4 container (falling back to WebM when the codecs are
 /// only WebM-compatible) with ffmpeg, no re-encoding, then replace the original with it.
-async fn remux_video(path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn remux_video(path: &str) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let source = Path::new(path);
     let mut errors = Vec::new();
     for fmt in ["mp4", "webm"] {
@@ -1524,7 +1549,7 @@ async fn remux_video(path: &str) -> Result<(), Box<dyn std::error::Error + Send 
         fs::remove_file(source).await?;
         fs::rename(&tmp_path, &final_path).await?;
         log::info!("Remuxed {} -> {}", path, final_path.display());
-        return Ok(());
+        return Ok(final_path);
     }
     Err(errors.join(" | ").into())
 }
