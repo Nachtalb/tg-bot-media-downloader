@@ -50,6 +50,16 @@ instead of being downloaded over HTTP.
 shell completions. Per-chat stats and pending confirmations are kept in
 `stats_<chat>.json` / `queue_<chat>.json` in the working directory.
 
+## Docker
+
+`ghcr.io/nachtalb/tg-bot-media-downloader:latest` (also `:sha-<7>` per commit) is a
+`FROM scratch` image with the static binary, a static `ffmpeg` and zoneinfo
+(`TZ`, default `Europe/Zurich`, sets the date folders). It runs as `3002:3002`
+with `/data` as working directory. The main settings also read env vars
+(`BOT_TOKEN`, `DESTINATION`, `LOCAL_MODE`, `TELEGRAM_API_SERVER`,
+`MAX_CONCURRENT_DOWNLOADS`, see `--help`). [`compose.example.yaml`](compose.example.yaml)
+runs it next to a local Bot API server.
+
 ## Tests
 
 ```bash

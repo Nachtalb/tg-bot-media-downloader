@@ -1,0 +1,48 @@
+# Bot + local Telegram Bot API server. Copy to compose.yaml, put BOT_TOKEN,
+# TELEGRAM_API_ID and TELEGRAM_API_HASH (https://my.telegram.org) in .env.
+#
+# In local mode getFile returns an absolute path inside the Bot API server's
+# --dir, and the bot renames that file into DESTINATION. So:
+#   - both containers mount the dataset at the SAME path (/media), and
+#   - the Bot API dir and DESTINATION live under that one mount, so the rename
+#     is instant (across mounts it falls back to copy + delete).
+# Both run as 3002:3002, the dataset owner, so the bot may delete the original.
+# Create bot-api/, bot-api-tmp/, downloads/ and state/ in the dataset first,
+# owned by 3002:3002; the Bot API server refuses to start on a missing --dir.
+#
+# No inbound port: the bot long-polls. --telegram-webhook-url is not needed
+# (teloxide's polling deletes any webhook at start).
+
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    restart: unless-stopped
+    user: "3002:3002"
+    # The image's entrypoint chowns as root and drops to uid 101; run the server directly instead.
+    entrypoint: ["telegram-bot-api"]
+    command:
+      - --local
+      - --http-port=8081
+      - --dir=/media/bot-api
+      - --temp-dir=/media/bot-api-tmp
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?set TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?set TELEGRAM_API_HASH}
+    volumes:
+      - /mnt/Bifrost/MediaDownloader:/media
+
+  downloader:
+    image: ghcr.io/nachtalb/tg-bot-media-downloader:latest
+    restart: unless-stopped
+    depends_on: [telegram-bot-api]
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?set BOT_TOKEN}
+      LOCAL_MODE: "true"
+      TELEGRAM_API_SERVER: http://telegram-bot-api:8081
+      DESTINATION: /media/downloads
+      MAX_CONCURRENT_DOWNLOADS: "100"
+      TZ: Europe/Zurich
+    volumes:
+      - /mnt/Bifrost/MediaDownloader:/media
+      # stats_<chat>.json / queue_<chat>.json
+      - /mnt/Bifrost/MediaDownloader/state:/data
