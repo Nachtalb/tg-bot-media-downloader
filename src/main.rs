@@ -1,3 +1,4 @@
+use chrono::{DateTime, Local};
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
 use serde::{Deserialize, Serialize};
@@ -5,7 +6,6 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use chrono::{DateTime, Local};
 use teloxide::{
     net::Download,
     prelude::*,
@@ -314,7 +314,14 @@ async fn get_or_create_actor(
     let config_clone = config.clone();
     let tx_for_actor = tx.clone();
     let senders_clone = senders.clone();
-    tokio::spawn(run_ui_actor(bot_clone, chat_id, rx, tx_for_actor, config_clone, senders_clone));
+    tokio::spawn(run_ui_actor(
+        bot_clone,
+        chat_id,
+        rx,
+        tx_for_actor,
+        config_clone,
+        senders_clone,
+    ));
     tx
 }
 
@@ -402,7 +409,11 @@ async fn file_handler(
     } else if let Some(vn) = msg.video_note() {
         (vn.file.id.clone(), "video_note".to_string(), vn.file.size)
     } else if let Some(sticker) = msg.sticker() {
-        (sticker.file.id.clone(), "sticker".to_string(), sticker.file.size)
+        (
+            sticker.file.id.clone(),
+            "sticker".to_string(),
+            sticker.file.size,
+        )
     } else {
         return Ok(());
     };
@@ -717,24 +728,19 @@ async fn run_ui_actor(
                 let msg_id = t.msg_id;
 
                 let handle = tokio::spawn(async move {
-                    let _ = tx_dl.send(DownloadEvent::TaskStarted(task_id.clone())).await;
+                    let _ = tx_dl
+                        .send(DownloadEvent::TaskStarted(task_id.clone()))
+                        .await;
 
                     match download_file_logic(
-                        &bot_dl,
-                        &file_id,
-                        &file_name,
-                        &config_dl,
-                        chat_id,
-                        msg_id,
+                        &bot_dl, &file_id, &file_name, &config_dl, chat_id, msg_id,
                     )
                     .await
                     {
                         Ok(_) => {
                             let _ = tx_dl.send(DownloadEvent::TaskDone(task_id.clone())).await;
                             time::sleep(Duration::from_secs(3)).await;
-                            let _ = tx_dl
-                                .send(DownloadEvent::TaskRemove(task_id.clone()))
-                                .await;
+                            let _ = tx_dl.send(DownloadEvent::TaskRemove(task_id.clone())).await;
                         }
                         Err(e) => {
                             let _ = tx_dl
@@ -1180,7 +1186,9 @@ fn generate_status_text(
                 // Show error message in the status
                 text.push_str(&format!(
                     "❌ <code>[{}]</code> {} \n   <i>{}</i>\n",
-                    size_str, link_html, escape_html(err_msg)
+                    size_str,
+                    link_html,
+                    escape_html(err_msg)
                 ));
             }
         }
@@ -1213,7 +1221,10 @@ fn generate_status_text(
         }
 
         if has_errors {
-            buttons.push(InlineKeyboardButton::callback("Clear Errors 🗑️", "clear_errors"));
+            buttons.push(InlineKeyboardButton::callback(
+                "Clear Errors 🗑️",
+                "clear_errors",
+            ));
         }
 
         Some(InlineKeyboardMarkup::new(vec![buttons]))
@@ -1260,7 +1271,9 @@ async fn download_file_logic(
     };
     let max_name_len: usize = 255;
     let separator_len = 1; // the '_' between prefix and id
-    let available = max_name_len.saturating_sub(ext_part.len()).saturating_sub(separator_len);
+    let available = max_name_len
+        .saturating_sub(ext_part.len())
+        .saturating_sub(separator_len);
     // Reserve at least 20 chars for file_id tail
     let min_id_len: usize = 20;
     let id_str = &file_id.0;
@@ -1273,7 +1286,10 @@ async fn download_file_logic(
         let prefix_take = max_prefix.min(name_prefix.len());
         let id_budget = available - prefix_take;
         let id_take = id_budget.min(id_str.len());
-        (&name_prefix[..prefix_take], &id_str[id_str.len().saturating_sub(id_take)..])
+        (
+            &name_prefix[..prefix_take],
+            &id_str[id_str.len().saturating_sub(id_take)..],
+        )
     };
     let file_name = format!("{}_{}{}", used_prefix, used_id, ext_part);
     let destination = format!("{}/{}", final_dir, file_name);
@@ -1423,7 +1439,11 @@ fn sniff_media(head: &[u8]) -> Option<MediaContainer> {
     }
     if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
         let is_webm = head.windows(4).any(|w| w == b"webm");
-        return Some(if is_webm { MediaContainer::Webm } else { MediaContainer::Mkv });
+        return Some(if is_webm {
+            MediaContainer::Webm
+        } else {
+            MediaContainer::Mkv
+        });
     }
     if head.len() >= 377 && head[0] == 0x47 && head[188] == 0x47 && head[376] == 0x47 {
         return Some(MediaContainer::MpegTs);
@@ -1466,7 +1486,12 @@ async fn fix_media_container(path: &str) -> std::path::PathBuf {
         return match remux_video(path).await {
             Ok(remuxed) => remuxed,
             Err(e) => {
-                log::warn!("Could not remux {:?} file {} to mp4/webm: {}", container, path, e);
+                log::warn!(
+                    "Could not remux {:?} file {} to mp4/webm: {}",
+                    container,
+                    path,
+                    e
+                );
                 Path::new(path).to_path_buf()
             }
         };
@@ -1509,7 +1534,9 @@ async fn fix_media_container(path: &str) -> std::path::PathBuf {
 
 /// Stream-copy a video into an MP4 container (falling back to WebM when the codecs are
 /// only WebM-compatible) with ffmpeg, no re-encoding, then replace the original with it.
-async fn remux_video(path: &str) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+async fn remux_video(
+    path: &str,
+) -> Result<std::path::PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let source = Path::new(path);
     let mut errors = Vec::new();
     for fmt in ["mp4", "webm"] {
@@ -1522,10 +1549,19 @@ async fn remux_video(path: &str) -> Result<std::path::PathBuf, Box<dyn std::erro
         }
         let tmp_path = source.with_extension(format!("remux.tmp.{}", fmt));
         let mut cmd = tokio::process::Command::new("ffmpeg");
-        cmd.args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-fflags", "+genpts", "-i"])
-            .arg(source)
-            // Keep video and audio only: timecode/data tracks cannot live in mp4/webm.
-            .args(["-map", "0:v", "-map", "0:a?", "-dn", "-c", "copy"]);
+        cmd.args([
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-y",
+            "-fflags",
+            "+genpts",
+            "-i",
+        ])
+        .arg(source)
+        // Keep video and audio only: timecode/data tracks cannot live in mp4/webm.
+        .args(["-map", "0:v", "-map", "0:a?", "-dn", "-c", "copy"]);
         if fmt == "mp4" {
             cmd.args(["-movflags", "+faststart"]);
         }
@@ -1557,13 +1593,34 @@ mod media_container_tests {
 
     #[test]
     fn detects_common_containers() {
-        assert_eq!(sniff_media(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]), Some(MediaContainer::Jpeg));
-        assert_eq!(sniff_media(b"\x89PNG\r\n\x1a\n...."), Some(MediaContainer::Png));
-        assert_eq!(sniff_media(b"RIFF\0\0\0\0WEBPVP8 "), Some(MediaContainer::Webp));
-        assert_eq!(sniff_media(b"\0\0\0\x18ftypisom\0\0\0\x01isomiso4"), Some(MediaContainer::Mp4));
-        assert_eq!(sniff_media(b"\0\0\0\x14ftypqt  \0\0\0\0qt  "), Some(MediaContainer::Mov));
-        assert_eq!(sniff_media(b"\0\0\0\x18ftypheic\0\0\0\0mif1heic"), Some(MediaContainer::Heic));
-        assert_eq!(sniff_media(b"\x1a\x45\xdf\xa3\x01\0\0\0\0\0\0\x1f\x42\x86\x81\x01\x42\x82\x84webm"), Some(MediaContainer::Webm));
+        assert_eq!(
+            sniff_media(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]),
+            Some(MediaContainer::Jpeg)
+        );
+        assert_eq!(
+            sniff_media(b"\x89PNG\r\n\x1a\n...."),
+            Some(MediaContainer::Png)
+        );
+        assert_eq!(
+            sniff_media(b"RIFF\0\0\0\0WEBPVP8 "),
+            Some(MediaContainer::Webp)
+        );
+        assert_eq!(
+            sniff_media(b"\0\0\0\x18ftypisom\0\0\0\x01isomiso4"),
+            Some(MediaContainer::Mp4)
+        );
+        assert_eq!(
+            sniff_media(b"\0\0\0\x14ftypqt  \0\0\0\0qt  "),
+            Some(MediaContainer::Mov)
+        );
+        assert_eq!(
+            sniff_media(b"\0\0\0\x18ftypheic\0\0\0\0mif1heic"),
+            Some(MediaContainer::Heic)
+        );
+        assert_eq!(
+            sniff_media(b"\x1a\x45\xdf\xa3\x01\0\0\0\0\0\0\x1f\x42\x86\x81\x01\x42\x82\x84webm"),
+            Some(MediaContainer::Webm)
+        );
         assert_eq!(sniff_media(&ts_packets()), Some(MediaContainer::MpegTs));
         assert_eq!(sniff_media(b"<?xpacket begin="), None);
         assert_eq!(sniff_media(b""), None);
@@ -1578,7 +1635,12 @@ mod media_container_tests {
         assert!(MediaContainer::Jpeg.accepts("jpeg"));
         assert!(!MediaContainer::Mp4.accepts("jpg"));
         assert!(!MediaContainer::Webp.accepts("jpg"));
-        for c in [MediaContainer::Mov, MediaContainer::Mkv, MediaContainer::Avi, MediaContainer::MpegTs] {
+        for c in [
+            MediaContainer::Mov,
+            MediaContainer::Mkv,
+            MediaContainer::Avi,
+            MediaContainer::MpegTs,
+        ] {
             assert!(c.needs_remux(), "{:?}", c);
         }
         assert!(!MediaContainer::Mp4.needs_remux());
