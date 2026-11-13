@@ -1357,7 +1357,90 @@ async fn download_file_logic(
             Err(e) => log::warn!("Could not autocrop {}: {}", final_path.display(), e),
         }
     }
+    if let Err(e) = append_to_index(Path::new(&config.destination), &final_path).await {
+        log::warn!(
+            "Could not add {} to the media index: {}",
+            final_path.display(),
+            e
+        );
+    }
     Ok(true)
+}
+
+const INDEX_FILE: &str = ".media-index.jsonl";
+
+/// Serialises appends to the index so concurrent downloads never interleave lines.
+static INDEX_LOCK: Mutex<()> = Mutex::const_new(());
+
+#[derive(Serialize)]
+struct IndexEntry {
+    path: String,
+    size: u64,
+    mtime: u64,
+    xxh64: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+/// Index line for `file` (relative to `dest`), or `None` for non-media files.
+async fn index_line(dest: &Path, file: &Path) -> std::io::Result<Option<String>> {
+    use tokio::io::AsyncReadExt;
+    let kind = match sniff_media(&read_head(&file.to_string_lossy()).await?) {
+        None => return Ok(None),
+        Some(
+            MediaContainer::Jpeg
+            | MediaContainer::Png
+            | MediaContainer::Gif
+            | MediaContainer::Webp
+            | MediaContainer::Heic
+            | MediaContainer::Avif,
+        ) => "image",
+        Some(_) => "video",
+    };
+    let rel = file.strip_prefix(dest).map_err(std::io::Error::other)?;
+    let path = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+
+    let mut f = fs::File::open(file).await?;
+    let meta = f.metadata().await?;
+    let mtime = meta
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut hasher = xxhash_rust::xxh64::Xxh64::new(0);
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let entry = IndexEntry {
+        path,
+        size: meta.len(),
+        mtime,
+        xxh64: format!("{:016x}", hasher.digest()),
+        kind,
+    };
+    Ok(Some(serde_json::to_string(&entry)? + "\n"))
+}
+
+async fn append_to_index(dest: &Path, file: &Path) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let Some(line) = index_line(dest, file).await? else {
+        return Ok(());
+    };
+    let _guard = INDEX_LOCK.lock().await;
+    let mut index = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dest.join(INDEX_FILE))
+        .await?;
+    index.write_all(line.as_bytes()).await
 }
 
 /// Media container detected from the first bytes of a file.
@@ -1649,5 +1732,47 @@ mod media_container_tests {
         }
         assert!(!MediaContainer::Mp4.needs_remux());
         assert!(!MediaContainer::Webm.needs_remux());
+    }
+}
+
+#[cfg(test)]
+mod media_index_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn appends_one_line_per_final_file() {
+        let dest = std::env::temp_dir().join(format!("downloader-index-{}", std::process::id()));
+        let day = dest.join("2026-01-02");
+        std::fs::create_dir_all(&day).unwrap();
+        // 3 MiB + 7 so hashing spans several read chunks.
+        let mut bytes: Vec<u8> = (0..3 * 1024 * 1024 + 7)
+            .map(|i| (i * 31 % 251) as u8)
+            .collect();
+        bytes[..3].copy_from_slice(&[0xFF, 0xD8, 0xFF]);
+        let file = day.join("photo_abc.jpg");
+        std::fs::write(&file, &bytes).unwrap();
+        std::fs::write(day.join("doc_x.pdf"), b"%PDF-1.7").unwrap();
+
+        // `dest` with a trailing slash, like the -d flag in production.
+        let dest_arg = format!("{}/", dest.display());
+        append_to_index(Path::new(&dest_arg), &file).await.unwrap();
+        append_to_index(Path::new(&dest_arg), &day.join("doc_x.pdf"))
+            .await
+            .unwrap();
+
+        let index = std::fs::read_to_string(dest.join(INDEX_FILE)).unwrap();
+        let mtime = std::fs::metadata(&file)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Hash from `xxh64sum` over the same bytes.
+        let expected = format!(
+            "{{\"path\":\"2026-01-02/photo_abc.jpg\",\"size\":3145735,\"mtime\":{mtime},\"xxh64\":\"4d2d7571672a1049\",\"type\":\"image\"}}\n"
+        );
+        std::fs::remove_dir_all(&dest).unwrap();
+        assert_eq!(index, expected);
     }
 }

@@ -15,6 +15,9 @@ you send or forward to it into a local folder.
   [autocrop](https://github.com/Nachtalb/autocrop-rs): status bars, app chrome
   and letterbox bars are cut from images (JPEG, PNG, WebP) and MP4/WebM videos.
   The cropped file replaces the download. Turn off with `--autocrop false`.
+- Appends one JSON line per finished image/video to `<destination>/.media-index.jsonl`
+  (`path` relative to the destination, `size`, `mtime`, `xxh64` of the final file,
+  `type` `image`/`video`), so other tools can follow new files without rescanning.
 - One live status message per chat shows the queue, errors and totals, with
   buttons to clear errors and resend confirmations.
 - Size limits: 20 MB on the public Bot API. With `--local-mode` files up to
