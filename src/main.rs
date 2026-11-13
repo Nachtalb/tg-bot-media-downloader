@@ -212,7 +212,7 @@ async fn main() {
     log::info!("Starting Cargo Downloader Bot (Event Based)...");
 
     // Create a custom client with increased timeout
-    let client = reqwest::Client::builder()
+    let client = teloxide::net::default_reqwest_settings()
         .timeout(Duration::from_secs(86400)) // 24 hours timeout for large downloads
         .connect_timeout(Duration::from_secs(60))
         .build()
