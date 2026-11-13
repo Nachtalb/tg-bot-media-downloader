@@ -27,15 +27,15 @@ mod crop;
 #[clap(author, version, about = "Telegram file downloader bot")]
 struct Config {
     /// Token
-    #[clap(short, long)]
+    #[clap(short, long, env = "BOT_TOKEN", hide_env_values = true)]
     token: String,
 
     /// Destination folder for downloaded files
-    #[clap(short, long, default_value = "downloads")]
+    #[clap(short, long, env = "DESTINATION", default_value = "downloads")]
     destination: String,
 
     /// Max concurrent downloads
-    #[clap(long, default_value = "10")]
+    #[clap(long, env = "MAX_CONCURRENT_DOWNLOADS", default_value = "10")]
     max_concurrent_downloads: usize,
 
     /// Create date-based subfolders (e.g., downloads/2023-10-27/)
@@ -47,11 +47,15 @@ struct Config {
     autocrop: bool,
 
     /// Use local Bot API server mode
-    #[clap(long)]
+    #[clap(long, env = "LOCAL_MODE")]
     local_mode: bool,
 
     /// Local Bot API server URL (e.g., http://localhost:8081)
-    #[clap(long, default_value = "http://localhost:8081")]
+    #[clap(
+        long,
+        env = "TELEGRAM_API_SERVER",
+        default_value = "http://localhost:8081"
+    )]
     telegram_api_server: String,
 
     /// Webhook URL for receiving updates (e.g., http://localhost:8433/bot)
