@@ -100,7 +100,11 @@ async fn probe_clip(path: &Path, frame: &Path) -> Result<Option<Rect>, Error> {
 }
 
 fn is_black(img: &RgbImage) -> bool {
-    let sum: f32 = img.pixels.iter().map(|&p| autocrop::image::luminance(p)).sum();
+    let sum: f32 = img
+        .pixels
+        .iter()
+        .map(|&p| autocrop::image::luminance(p))
+        .sum();
     sum / img.pixels.len().max(1) as f32 <= BLACK_LUMA
 }
 
@@ -116,7 +120,11 @@ async fn ffmpeg(args: &[String]) -> Result<bool, Error> {
         .output()
         .await?;
     if !out.status.success() {
-        log::warn!("ffmpeg {}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim());
+        log::warn!(
+            "ffmpeg {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(out.status.success())
 }
@@ -137,15 +145,28 @@ mod tests {
         assert!(img.height < 1286, "{}x{}", img.width, img.height);
 
         let flat = dir.join("flat.png");
-        RgbImage::solid(64, 64, [200, 200, 200]).save(&flat).unwrap();
+        RgbImage::solid(64, 64, [200, 200, 200])
+            .save(&flat)
+            .unwrap();
         assert!(!autocrop_file(&flat).await.unwrap());
 
         let clip = dir.join("clip.mp4");
-        let args = ["-loop", "1", "-t", "1", "-i", "tests/screenshot.jpg", "-r", "5", "-pix_fmt", "yuv420p"]
-            .map(String::from)
-            .into_iter()
-            .chain([clip.to_string_lossy().into_owned()])
-            .collect::<Vec<_>>();
+        let args = [
+            "-loop",
+            "1",
+            "-t",
+            "1",
+            "-i",
+            "tests/screenshot.jpg",
+            "-r",
+            "5",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+        .map(String::from)
+        .into_iter()
+        .chain([clip.to_string_lossy().into_owned()])
+        .collect::<Vec<_>>();
         assert!(ffmpeg(&args).await.unwrap());
         assert!(autocrop_file(&clip).await.unwrap());
         let _ = std::fs::remove_dir_all(&dir);
