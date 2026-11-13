@@ -1,0 +1,39 @@
+name: Docker
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+        with:
+          cleanup: false
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: sha
+        run: echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ghcr.io/nachtalb/tg-bot-media-downloader:sha-${{ steps.sha.outputs.short }}
+            ghcr.io/nachtalb/tg-bot-media-downloader:latest
+          cache-from: type=registry,ref=ghcr.io/nachtalb/tg-bot-media-downloader-buildcache:master
+          # PR caches would be unreadable by other refs, so only master writes it.
+          cache-to: ${{ github.event_name == 'push' && 'type=registry,ref=ghcr.io/nachtalb/tg-bot-media-downloader-buildcache:master,mode=max,image-manifest=true,oci-mediatypes=true' || '' }}
