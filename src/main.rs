@@ -648,22 +648,22 @@ async fn callback_handler(
                         .await;
                 }
             }
-        } else if let Some(msg_id_str) = data.strip_prefix("cancel_download:") {
-            if let Ok(msg_id_val) = msg_id_str.parse::<i32>() {
-                let msg_id = MessageId(msg_id_val);
-                // User cancelled large file download
-                let _ = tx.send(DownloadEvent::UserCancelled(msg_id)).await;
+        } else if let Some(msg_id_str) = data.strip_prefix("cancel_download:")
+            && let Ok(msg_id_val) = msg_id_str.parse::<i32>()
+        {
+            let msg_id = MessageId(msg_id_val);
+            // User cancelled large file download
+            let _ = tx.send(DownloadEvent::UserCancelled(msg_id)).await;
 
-                bot.answer_callback_query(q.id)
-                    .text("Download cancelled")
-                    .await?;
+            bot.answer_callback_query(q.id)
+                .text("Download cancelled")
+                .await?;
 
-                // Edit the confirmation message
-                if let Some(MaybeInaccessibleMessage::Regular(msg)) = &q.message {
-                    let _ = bot
-                        .edit_message_text(chat_id, msg.id, "❌ Download cancelled.")
-                        .await;
-                }
+            // Edit the confirmation message
+            if let Some(MaybeInaccessibleMessage::Regular(msg)) = &q.message {
+                let _ = bot
+                    .edit_message_text(chat_id, msg.id, "❌ Download cancelled.")
+                    .await;
             }
         }
     }
@@ -710,16 +710,11 @@ async fn run_ui_actor(
                 // Prepare data for spawn
                 let bot_dl = bot.clone();
                 let tx_dl = tx.clone();
-                let dest_dir = config.destination.clone();
-                let local_mode = config.local_mode;
-                let date_subfolders = config.date_subfolders;
-                let autocrop = config.autocrop;
-                
+                let config_dl = config.clone();
                 let task_id = t.id.clone();
                 let file_id = t.file_id.clone().expect("Queued task missing file_id");
                 let file_name = t.file_name.clone();
                 let msg_id = t.msg_id;
-                let chat_id = chat_id;
 
                 let handle = tokio::spawn(async move {
                     let _ = tx_dl.send(DownloadEvent::TaskStarted(task_id.clone())).await;
@@ -728,12 +723,9 @@ async fn run_ui_actor(
                         &bot_dl,
                         &file_id,
                         &file_name,
-                        &dest_dir,
-                        local_mode,
+                        &config_dl,
                         chat_id,
                         msg_id,
-                        date_subfolders,
-                        autocrop,
                     )
                     .await
                     {
@@ -784,8 +776,7 @@ async fn run_ui_actor(
                                 let mut is_duplicate = false;
 
                                 // Check for duplicates if awaiting confirmation
-                                if is_awaiting && t.file_id.is_some() {
-                                    let file_id = t.file_id.as_ref().unwrap();
+                                if is_awaiting && let Some(file_id) = t.file_id.as_ref() {
                                     // Find existing task with same file_id in awaiting confirmation state
                                     if let Some(existing) = tasks.iter_mut().find(|task|
                                         matches!(task.state, DownloadState::AwaitingConfirmation) &&
@@ -1237,12 +1228,9 @@ async fn download_file_logic(
     bot: &Bot,
     file_id: &FileId,
     name_prefix: &str,
-    dest_dir: &str,
-    local_mode: bool,
+    config: &Config,
     chat_id: ChatId,
     msg_id: MessageId,
-    date_subfolders: bool,
-    autocrop: bool,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let file = bot.get_file(file_id.clone()).await?;
     let file_path = file.path.clone();
@@ -1252,8 +1240,9 @@ async fn download_file_logic(
         .unwrap_or("");
 
     // Determine final destination directory
+    let dest_dir = &config.destination;
     let mut final_dir = dest_dir.to_string();
-    if date_subfolders {
+    if config.date_subfolders {
         let date_str = Local::now().format("%Y-%m-%d").to_string();
         final_dir = format!("{}/{}", dest_dir, date_str);
         // Ensure subfolder exists
@@ -1303,7 +1292,7 @@ async fn download_file_logic(
         return Ok(false);
     }
 
-    if local_mode {
+    if config.local_mode {
         // In local mode, file.path is an absolute path on the local filesystem
         // We can just move/copy the file instead of downloading
         log::info!(
@@ -1341,7 +1330,7 @@ async fn download_file_logic(
     // Telegram trusts the sender's file name, so the extension can lie about the
     // content (a .jpg that is an MP4, an .mp4 that is an MPEG-TS stream, ...).
     let final_path = fix_media_container(&destination).await;
-    if autocrop {
+    if config.autocrop {
         match crop::autocrop_file(&final_path).await {
             Ok(true) => log::info!("Cropped {}", final_path.display()),
             Ok(false) => {}
